@@ -125,7 +125,12 @@ pub fn dump_global_field_map() -> HashMap<String, String> {
 pub fn get_enum_names() -> HashMap<String, String> {
     let mut output = HashMap::new();
 
-    let class = get_cached_class("XLua.ObjectTranslator.IniterAdderUnityEngineVector2").unwrap();
+    let Some(class) = get_cached_class("XLua.ObjectTranslator.IniterAdderUnityEngineVector2") else {
+        log::debug!(
+            "[Method NT] IniterAdderUnityEngineVector2 not found; skipping enum name translation"
+        );
+        return output;
+    };
     for method in class.get_methods() {
         let m_name = method.get_name();
 
@@ -133,7 +138,9 @@ pub fn get_enum_names() -> HashMap<String, String> {
             continue;
         }
 
-        let mi = MethodInfo::from_handle(method).unwrap();
+        let Ok(mi) = MethodInfo::from_handle(method) else {
+            continue;
+        };
 
         let args = mi.get_parameters();
 
@@ -141,7 +148,10 @@ pub fn get_enum_names() -> HashMap<String, String> {
             continue;
         };
 
-        let obf_name = first_arg.get_parameter_type().unwrap().il_name();
+        let Ok(first_arg_type) = first_arg.get_parameter_type() else {
+            continue;
+        };
+        let obf_name = first_arg_type.il_name();
 
         if !util::is_obf(&obf_name) {
             continue;

@@ -59,14 +59,26 @@ static IL2CPP_OBJECT_NEW_RVA: LazyLock<usize> = LazyLock::new(|| {
 
 static XLUA_REGISTER_OBJECT_RVA: LazyLock<usize> = LazyLock::new(|| {
     let raw_class_name = &*XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS;
+    if raw_class_name.is_empty() {
+        return 0;
+    }
     let class_name = raw_class_name
         .split('<')
         .next()
         .unwrap()
         .trim_end_matches('.');
-    let xlua_object_translator_class = get_cached_class(class_name).unwrap();
-    let static_class_type = RuntimeType::from_class(xlua_object_translator_class).unwrap();
+    let Some(xlua_object_translator_class) = get_cached_class(class_name) else {
+        log::debug!("[Proto Dumper] failed to resolve XLua ObjectTranslator class");
+        return 0;
+    };
+    let Ok(static_class_type) = RuntimeType::from_class(xlua_object_translator_class) else {
+        log::debug!("[Proto Dumper] failed to create XLua ObjectTranslator runtime type");
+        return 0;
+    };
     let delegate_name = &*XLUA_OBJECT_TRANSLATOR_DELEGATE;
+    if delegate_name.is_empty() {
+        return 0;
+    }
 
     let methods = static_class_type.get_methods_il2cpp();
     if let Some(next) = methods
@@ -84,17 +96,26 @@ static XLUA_REGISTER_OBJECT_RVA: LazyLock<usize> = LazyLock::new(|| {
     }
 
     log::debug!("[Proto Dumper] failed to find XLua::RegisterObject via method index!");
-    std::thread::sleep(std::time::Duration::from_millis(u64::MAX));
     0
 });
 
 static RETCODE_FIELD_NAME: LazyLock<Cow<'static, str>> = LazyLock::new(|| {
-    let cake_race_base_rsp_message_class =
-        get_cached_class("RPG.Client.LittleGame.CakeRace.CakeRaceBaseRspMessage<T>").unwrap();
+    let Some(cake_race_base_rsp_message_class) =
+        get_cached_class("RPG.Client.LittleGame.CakeRace.CakeRaceBaseRspMessage<T>")
+    else {
+        log::debug!("[Proto Dumper] CakeRaceBaseRspMessage<T> not found; using retcode fallback");
+        return Cow::Borrowed("retcode");
+    };
 
-    let cake_race_type = RuntimeType::from_class(cake_race_base_rsp_message_class).unwrap();
+    let Ok(cake_race_type) = RuntimeType::from_class(cake_race_base_rsp_message_class) else {
+        log::debug!("[Proto Dumper] invalid CakeRaceBaseRspMessage<T>; using retcode fallback");
+        return Cow::Borrowed("retcode");
+    };
 
-    let base_type = cake_race_type.get_base_type().unwrap();
+    let Ok(base_type) = cake_race_type.get_base_type() else {
+        log::debug!("[Proto Dumper] CakeRace base type unavailable; using retcode fallback");
+        return Cow::Borrowed("retcode");
+    };
     let base_class = base_type.get_il2cpp_type().get_class();
 
     let properties = base_type.get_properties(62);
@@ -104,8 +125,7 @@ static RETCODE_FIELD_NAME: LazyLock<Cow<'static, str>> = LazyLock::new(|| {
             "[Proto Dumper] there are no properties in {} to get MsgRetcode",
             base_class.byval_arg().il_name()
         );
-        std::thread::sleep(std::time::Duration::from_millis(u64::MAX));
-        return Cow::Borrowed("");
+        return Cow::Borrowed("retcode");
     };
 
     let property_name = property.get_name().unwrap().as_str();
@@ -116,10 +136,19 @@ static RETCODE_FIELD_NAME: LazyLock<Cow<'static, str>> = LazyLock::new(|| {
 });
 
 pub static NETWORK_MANAGER_SEND_NAME: LazyLock<Cow<'static, str>> = LazyLock::new(|| {
-    let cycle_score_service =
-        RuntimeType::from_class(get_cached_class("RPG.Client.CycleScoreService").unwrap()).unwrap();
+    let Some(class) = get_cached_class("RPG.Client.CycleScoreService") else {
+        log::debug!("[Proto Dumper] CycleScoreService not found");
+        return Cow::Borrowed("");
+    };
+    let Ok(cycle_score_service) = RuntimeType::from_class(class) else {
+        log::debug!("[Proto Dumper] CycleScoreService runtime type is invalid");
+        return Cow::Borrowed("");
+    };
 
-    let the_class = cycle_score_service.get_base_type().unwrap();
+    let Ok(the_class) = cycle_score_service.get_base_type() else {
+        log::debug!("[Proto Dumper] CycleScoreService base type is unavailable");
+        return Cow::Borrowed("");
+    };
     for method in the_class.get_methods_il2cpp() {
         if method.get_is_generic_method().unwrap().unbox() {
             let params = method.get_parameters();
@@ -139,15 +168,20 @@ pub static NETWORK_MANAGER_SEND_NAME: LazyLock<Cow<'static, str>> = LazyLock::ne
     }
 
     log::debug!("[Proto Dumper] failed to get NetworkManager::Send name");
-    std::thread::sleep(std::time::Duration::from_millis(u64::MAX));
     Cow::Borrowed("")
 });
 
 pub static NETWORK_MANAGER_SEND_VA: LazyLock<usize> = LazyLock::new(|| {
-    let cycle_score_service =
-        RuntimeType::from_class(get_cached_class("RPG.Client.CycleScoreService").unwrap()).unwrap();
+    let Some(class) = get_cached_class("RPG.Client.CycleScoreService") else {
+        return 0;
+    };
+    let Ok(cycle_score_service) = RuntimeType::from_class(class) else {
+        return 0;
+    };
 
-    let the_class = cycle_score_service.get_base_type().unwrap();
+    let Ok(the_class) = cycle_score_service.get_base_type() else {
+        return 0;
+    };
     for method in the_class.get_methods_il2cpp() {
         if method.get_is_generic_method().unwrap().unbox() {
             let params = method.get_parameters();
@@ -170,16 +204,26 @@ pub static NETWORK_MANAGER_SEND_VA: LazyLock<usize> = LazyLock::new(|| {
     }
 
     log::debug!("[Proto Dumper] failed to get NetworkManager::Send2");
-    std::thread::sleep(std::time::Duration::from_millis(u64::MAX));
     0
 });
 
 pub static FIGHT_GAME_SEND: LazyLock<usize> = LazyLock::new(|| {
-    let multiplayer_manager =
-        RuntimeType::from_class(get_cached_class("RPG.Client.GlobalVars").unwrap())
-            .unwrap()
-            .get_field("s_MultiplayerManager".into(), 62)
-            .unwrap();
+    let Some(global_vars_class) = get_cached_class("RPG.Client.GlobalVars") else {
+        log::debug!("[Proto Dumper] GlobalVars not found; skipping FightGame::Send mapping");
+        return 0;
+    };
+    let Ok(global_vars) = RuntimeType::from_class(global_vars_class) else {
+        log::debug!(
+            "[Proto Dumper] GlobalVars runtime type invalid; skipping FightGame::Send mapping"
+        );
+        return 0;
+    };
+    let Ok(multiplayer_manager) = global_vars.get_field("s_MultiplayerManager".into(), 62) else {
+        log::debug!(
+            "[Proto Dumper] s_MultiplayerManager not found; skipping FightGame::Send mapping"
+        );
+        return 0;
+    };
 
     if !multiplayer_manager.is_null() {
         let multiplayer_manager = multiplayer_manager.get_field_type().unwrap();
@@ -197,14 +241,21 @@ pub static FIGHT_GAME_SEND: LazyLock<usize> = LazyLock::new(|| {
         }
     }
 
-    log::debug!("[Proto Dumper] failed to get FightGame::Send");
-    std::thread::sleep(std::time::Duration::from_millis(u64::MAX));
+    log::debug!(
+        "[Proto Dumper] failed to get FightGame::Send; continuing without fight request mapping"
+    );
     0
 });
 
 static XLUA_OBJECT_TRANSLATOR_DELEGATE: LazyLock<Cow<'static, str>> = LazyLock::new(|| {
-    let obj_translator_method_class =
-        get_cached_class(&XLUA_OBJECT_TRANSLATOR_METHOD_CLASS).unwrap();
+    let method_class_name = &*XLUA_OBJECT_TRANSLATOR_METHOD_CLASS;
+    if method_class_name.is_empty() {
+        return Cow::Borrowed("");
+    }
+    let Some(obj_translator_method_class) = get_cached_class(method_class_name) else {
+        log::debug!("[Proto Dumper] XLua ObjectTranslator method class not found");
+        return Cow::Borrowed("");
+    };
 
     let Some(obj_translator_method_idx) = CLASS_TABLE_VEC
         .get()
@@ -215,7 +266,6 @@ static XLUA_OBJECT_TRANSLATOR_DELEGATE: LazyLock<Cow<'static, str>> = LazyLock::
         log::debug!(
             "[Proto Dumper] failed to find XLUA_OBJECT_TRANSLATOR_METHOD_CLASS to get XLUA_OBJECT_TRANSLATOR_DELEGATE"
         );
-        std::thread::sleep(std::time::Duration::from_millis(u64::MAX));
         return Cow::Borrowed("");
     };
 
@@ -230,8 +280,14 @@ static XLUA_OBJECT_TRANSLATOR_DELEGATE: LazyLock<Cow<'static, str>> = LazyLock::
 });
 
 static XLUA_OBJECT_TRANSLATOR_METHOD_CLASS: LazyLock<Cow<'static, str>> = LazyLock::new(|| {
-    let obj_translator_static_class =
-        get_cached_class(&XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS).unwrap();
+    let static_class_name = &*XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS;
+    if static_class_name.is_empty() {
+        return Cow::Borrowed("");
+    }
+    let Some(obj_translator_static_class) = get_cached_class(static_class_name) else {
+        log::debug!("[Proto Dumper] XLua ObjectTranslator static class not found");
+        return Cow::Borrowed("");
+    };
 
     let Some(obj_translator_static_idx) = CLASS_TABLE_VEC
         .get()
@@ -242,7 +298,6 @@ static XLUA_OBJECT_TRANSLATOR_METHOD_CLASS: LazyLock<Cow<'static, str>> = LazyLo
         log::debug!(
             "[Proto Dumper] failed to find XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS to get XLUA_OBJECT_TRANSLATOR_METHOD_CLASS"
         );
-        std::thread::sleep(std::time::Duration::from_millis(u64::MAX));
         return Cow::Borrowed("");
     };
 
@@ -258,7 +313,12 @@ static XLUA_OBJECT_TRANSLATOR_METHOD_CLASS: LazyLock<Cow<'static, str>> = LazyLo
 
 static XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS: LazyLock<Cow<'static, str>> = LazyLock::new(
     || {
-        let gen_13_wrap_class = get_cached_class("XLua.CSObjectWrap.Gen_13_Wrap").unwrap();
+        let Some(gen_13_wrap_class) = get_cached_class("XLua.CSObjectWrap.Gen_13_Wrap") else {
+            log::debug!(
+                "[Proto Dumper] XLua.CSObjectWrap.Gen_13_Wrap not found; request name translation will be skipped"
+            );
+            return Cow::Borrowed("");
+        };
 
         let Some(gen_13_wrap_idx) = CLASS_TABLE_VEC
             .get()
@@ -269,7 +329,6 @@ static XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS: LazyLock<Cow<'static, str>> =
             log::debug!(
                 "[Proto Dumper] failed to find XLua.CSObjectWrap.Gen_13_Wrap to get XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS"
             );
-            std::thread::sleep(std::time::Duration::from_millis(u64::MAX));
             return Cow::Borrowed("");
         };
 
@@ -600,7 +659,7 @@ pub fn dump<W: Write>(
 
     log::debug!("[Proto Dumper] generating protobuf...");
 
-    let (cmd_ids_final, nt_map_final, type_to_item) = output::generate_protobuf(
+    let (cmd_ids_final, nt_map_final, _type_to_item) = output::generate_protobuf(
         &type_cache,
         &minimal_info_map,
         &rsp_notify_map,
@@ -616,7 +675,11 @@ pub fn dump<W: Write>(
             .or_insert_with(|| deobf_name);
     }
 
-    writeln!(cmdid_out, "{}", serde_json::to_string_pretty(&cmd_ids)?)?;
+    writeln!(
+        cmdid_out,
+        "{}",
+        serde_json::to_string_pretty(&cmd_ids_final)?
+    )?;
 
     log::debug!("[Proto Dumper] Protos dumped!");
 

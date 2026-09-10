@@ -30,6 +30,20 @@ pub fn ensure_dump_folder() -> std::io::Result<()> {
 }
 
 fn dump_proto(mode: ProtoDumpMode) -> anyhow::Result<()> {
+    if crate::script::TYPE_INFOS.get().is_none() || crate::script::METADATA_METHODS.get().is_none()
+    {
+        log::info!("[Proto Dumper] preparing Script metadata prerequisite...");
+        crate::script::dump();
+    }
+
+    if crate::script::TYPE_INFOS.get().is_none() {
+        anyhow::bail!("Script metadata prerequisite failed: TYPE_INFOS was not initialized");
+    }
+    if crate::script::METADATA_METHODS.get().is_none() {
+        anyhow::bail!("Script metadata prerequisite failed: METADATA_METHODS was not initialized");
+    }
+
+    log::info!("[Proto Dumper] starting mode {mode:?}");
     proto::dump(
         &mut std::fs::File::create("./DUMP/StarRail.proto")?,
         &mut std::fs::File::create("./DUMP/packetIds.json")?,

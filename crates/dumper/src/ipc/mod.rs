@@ -241,21 +241,37 @@ fn handle_command(responder: &Responder, command: FrontendCommand) {
 }
 
 fn handle_dumper(responder: &Responder, action: DumperAction) {
-    log::debug!("[Tunnel] run dumper: {}", action.label());
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    log::debug!("[Tunnel] run dumper: {action:?}");
     let start = Instant::now();
     responder.reply(BackendEvent::DumperStarted { action });
 
-    match actions::run(action) {
-        Ok(()) => {
+    match catch_unwind(AssertUnwindSafe(|| actions::run(action))) {
+        Ok(Ok(())) => {
             let seconds = start.elapsed().as_secs();
             log::debug!("[Tunnel] dumper finished: {} ({seconds}s)", action.label());
             responder.reply(BackendEvent::DumperFinished { action, seconds });
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             log::debug!("[Tunnel] dumper failed: {}: {error:#}", action.label());
             responder.reply(BackendEvent::DumperFailed {
                 action,
                 error: format!("{error:#}"),
+            });
+        }
+        Err(payload) => {
+            let message = if let Some(message) = payload.downcast_ref::<&str>() {
+                (*message).to_string()
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
+            log::error!("[Tunnel] dumper panicked: {}: {message}", action.label());
+            responder.reply(BackendEvent::DumperFailed {
+                action,
+                error: format!("internal dumper panic: {message}"),
             });
         }
     }

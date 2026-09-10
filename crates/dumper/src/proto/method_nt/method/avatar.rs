@@ -39,7 +39,6 @@ pub static AVATAR_HANDLER_CLASS: LazyLock<Cow<'static, str>> = LazyLock::new(|| 
     }
 
     log::debug!("[Method NT] failed to find AvatarHandlerClass");
-    std::thread::sleep(std::time::Duration::from_millis(u64::MAX));
     Cow::Borrowed("")
 });
 

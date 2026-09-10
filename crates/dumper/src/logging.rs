@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::windows::io::FromRawHandle;
 use std::sync::{LazyLock, Mutex, mpsc};
 use std::thread;
@@ -11,6 +11,7 @@ use windows::Win32::System::Pipes::CreatePipe;
 
 static LOG_SENDER: LazyLock<Mutex<Option<mpsc::SyncSender<LogEntry>>>> =
     LazyLock::new(|| Mutex::new(None));
+static LOG_FILE: LazyLock<Mutex<Option<std::fs::File>>> = LazyLock::new(|| Mutex::new(None));
 static LOGGER: IpcLogger = IpcLogger;
 
 const NOISY_TARGETS: &[&str] = &["ureq", "rustls", "h2", "hyper", "webpki"];
@@ -45,6 +46,7 @@ impl log::Log for IpcLogger {
             message: record.args().to_string(),
         };
 
+        persist(&entry);
         if let Some(sender) = LOG_SENDER.lock().unwrap().as_ref() {
             let _ = sender.try_send(entry);
         }
@@ -56,6 +58,11 @@ impl log::Log for IpcLogger {
 pub fn init() -> mpsc::Receiver<LogEntry> {
     let (tx, rx) = mpsc::sync_channel(8192);
     *LOG_SENDER.lock().unwrap() = Some(tx);
+    *LOG_FILE.lock().unwrap() = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("hsr-owner.log")
+        .ok();
 
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Debug);
@@ -103,15 +110,30 @@ fn capture_stdout_stderr() {
 }
 
 fn push_line(message: String) {
+    let entry = LogEntry {
+        timestamp_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default(),
+        level: LogLevel::Debug,
+        target: "stdout".to_string(),
+        message,
+    };
+
+    persist(&entry);
     if let Some(sender) = LOG_SENDER.lock().unwrap().as_ref() {
-        let _ = sender.try_send(LogEntry {
-            timestamp_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or_default(),
-            level: LogLevel::Debug,
-            target: "stdout".to_string(),
-            message,
-        });
+        let _ = sender.try_send(entry);
+    }
+}
+
+fn persist(entry: &LogEntry) {
+    let mut guard = LOG_FILE.lock().unwrap();
+    if let Some(file) = guard.as_mut() {
+        let _ = writeln!(
+            file,
+            "[{}] [{:?}] [{}] {}",
+            entry.timestamp_ms, entry.level, entry.target, entry.message
+        );
+        let _ = file.flush();
     }
 }

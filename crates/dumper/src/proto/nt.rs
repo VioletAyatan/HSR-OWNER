@@ -69,6 +69,7 @@ fn get_req_method_va_name_map() -> HashMap<usize, String> {
     let mut output = HashMap::new();
 
     let mappings = disasm_obf_deobf_method_by_xlua_obj_translator();
+    let translator_method_class = &*XLUA_OBJECT_TRANSLATOR_METHOD_CLASS;
     let mut unique_methods = HashMap::<Cow<'static, str>, Vec<Il2CppMethod>>::new();
     FUNCTIONS_TABLE_REFLECTION
         .get()
@@ -86,7 +87,9 @@ fn get_req_method_va_name_map() -> HashMap<usize, String> {
         };
 
         for method in methods {
-            if method.class().byval_arg().il_name() == *XLUA_OBJECT_TRANSLATOR_METHOD_CLASS {
+            if !translator_method_class.is_empty()
+                && method.class().byval_arg().il_name() == *translator_method_class
+            {
                 continue;
             }
 
@@ -100,11 +103,39 @@ fn get_req_method_va_name_map() -> HashMap<usize, String> {
 fn disasm_obf_deobf_method_by_xlua_obj_translator() -> HashMap<String, String> {
     let mut output = HashMap::new();
 
-    let delegate_class = get_cached_class(&XLUA_OBJECT_TRANSLATOR_DELEGATE).unwrap();
-    let delegate_type_rva = *TYPE_INFOS.get().unwrap().get(&delegate_class).unwrap();
+    let delegate_name = &*XLUA_OBJECT_TRANSLATOR_DELEGATE;
+    let fields_class_name = &*XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS;
+    let xlua_register_object_rva = *XLUA_REGISTER_OBJECT_RVA;
+    if delegate_name.is_empty() || fields_class_name.is_empty() || xlua_register_object_rva == 0 {
+        log::debug!(
+            "[Proto Dumper] XLua ObjectTranslator metadata incomplete; skipping request name translation"
+        );
+        return output;
+    }
 
-    let obj_translator_fields_class =
-        get_cached_class(&XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS).unwrap();
+    let Some(delegate_class) = get_cached_class(delegate_name) else {
+        log::debug!(
+            "[Proto Dumper] XLua delegate class not found; skipping request name translation"
+        );
+        return output;
+    };
+    let Some(type_infos) = TYPE_INFOS.get() else {
+        log::debug!("[Proto Dumper] TYPE_INFOS unavailable; skipping request name translation");
+        return output;
+    };
+    let Some(&delegate_type_rva) = type_infos.get(&delegate_class) else {
+        log::debug!(
+            "[Proto Dumper] XLua delegate TypeInfo unavailable; skipping request name translation"
+        );
+        return output;
+    };
+
+    let Some(obj_translator_fields_class) = get_cached_class(fields_class_name) else {
+        log::debug!(
+            "[Proto Dumper] XLua fields class not found; skipping request name translation"
+        );
+        return output;
+    };
     let obj_translator_fields = obj_translator_fields_class
         .get_fields()
         .into_iter()
@@ -128,7 +159,12 @@ fn disasm_obf_deobf_method_by_xlua_obj_translator() -> HashMap<String, String> {
         .collect::<HashMap<_, _>>();
 
     let slice = game_assembly_slice();
-    let xlua_register_object_rva = *XLUA_REGISTER_OBJECT_RVA;
+    if xlua_register_object_rva >= slice.len() {
+        log::debug!(
+            "[Proto Dumper] XLua RegisterObject RVA is out of range; skipping request name translation"
+        );
+        return output;
+    }
     let mut decoder = Decoder::with_ip(
         64,
         &slice[xlua_register_object_rva..],
@@ -240,32 +276,51 @@ pub fn get_req_map(
     rsp_notify_map: &HashMap<RuntimeType, u16>,
     req_map: &mut HashMap<RuntimeType, (u16, Option<String>)>,
 ) -> HashMap<RuntimeType, Vec<String>> {
+    let Some(type_infos) = TYPE_INFOS.get() else {
+        log::debug!("[Proto Dumper] TYPE_INFOS unavailable; skipping request mapping");
+        return HashMap::new();
+    };
+
     let type_info_rvas = minimal_info
         .iter()
         .filter(|(ty, _)| !ty.get_isenum().unwrap().unbox() && !rsp_notify_map.contains_key(ty))
-        .filter_map(|(ty, _)| {
-            TYPE_INFOS
-                .get()
-                .unwrap()
-                .get(&ty.get_il2cpp_type().get_class())
-                .copied()
-        })
+        .filter_map(|(ty, _)| type_infos.get(&ty.get_il2cpp_type().get_class()).copied())
         .collect::<HashSet<_>>();
 
-    let networkmanager_send_va = get_native_method(&format!(
-        "RPG.Client.NetworkManager::{}(System.UInt16,Google.Protobuf.IMessage,System.Boolean)",
-        *NETWORK_MANAGER_SEND_NAME
-    ))
-    .unwrap()
-    .va();
+    let networkmanager_send_name = &*NETWORK_MANAGER_SEND_NAME;
+    let networkmanager_send_va = if networkmanager_send_name.is_empty() {
+        0
+    } else {
+        get_native_method(&format!(
+            "RPG.Client.NetworkManager::{}(System.UInt16,Google.Protobuf.IMessage,System.Boolean)",
+            networkmanager_send_name
+        ))
+        .map_or(0, |method| method.va())
+    };
     let networkmanager_send_va2 = *NETWORK_MANAGER_SEND_VA;
     let networkmanager_send_va3 = *FIGHT_GAME_SEND;
 
     let mut targets = HashMap::with_capacity(3);
 
-    targets.insert(networkmanager_send_va, ReqFlavor::Standard);
-    targets.insert(networkmanager_send_va2, ReqFlavor::Standard);
-    targets.insert(networkmanager_send_va3, ReqFlavor::Fight);
+    if networkmanager_send_va != 0 {
+        targets.insert(networkmanager_send_va, ReqFlavor::Standard);
+    }
+    if networkmanager_send_va2 != 0 {
+        targets.insert(networkmanager_send_va2, ReqFlavor::Standard);
+    }
+    if networkmanager_send_va3 != 0 {
+        targets.insert(networkmanager_send_va3, ReqFlavor::Fight);
+    }
+
+    if targets.is_empty() {
+        log::debug!("[Proto Dumper] no request send targets found; skipping request mapping");
+        return HashMap::new();
+    }
+
+    log::debug!(
+        "[Proto Dumper] scanning request call sites with {} send target(s)",
+        targets.len()
+    );
 
     disasm_all_req(&type_info_rvas, targets, rsp_notify_map, req_map)
 }
