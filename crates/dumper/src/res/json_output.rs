@@ -47,6 +47,26 @@ pub(super) fn value(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     })
 }
 
+/// Publish another path for the same runtime table without allocating or
+/// serializing its managed rows a second time.
+pub(super) fn copy(source: &Path, destination: &Path) -> Result<()> {
+    write_file(destination, |writer| {
+        let mut reader = File::open(source)
+            .with_context(|| format!("open table snapshot {}", source.display()))?;
+        // Explicit bounded chunks keep memory checks active during large copies.
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            super::diagnostics::check_memory()?;
+            let count = std::io::Read::read(&mut reader, &mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..count])?;
+        }
+        Ok(())
+    })
+}
+
 pub(super) fn rows(
     path: &Path,
     enumerate: impl FnOnce(&mut dyn FnMut(serde_json::Value) -> Result<()>) -> Result<usize>,
@@ -94,6 +114,19 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value, serde_json::json!([{"row": 1}, {"row": 2}]));
+        let copied = root.join("copy.json");
+        copy(&path, &copied).unwrap();
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        assert!(copy(&root.join("missing.json"), &copied).is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        std::fs::remove_file(copied).unwrap();
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(root).unwrap();
     }

@@ -2,9 +2,120 @@
 
 最后更新：2026-09-25
 
-任务状态：**现场确认 Resources 导出期间内存耗尽；第二轮内存修复与保护已编译并通过 15 项测试，完整游戏内导出仍待验证。**
+任务状态：**第六轮游戏内完整流程已验收：用户确认成功，日志 finished，691503ms、64139 次文件发布；内存稳定，无 Error/序列化失败/保护中止。检查未发现阻止提交的问题。导出覆盖范围仍有已记录限制。**
 分析基线：Git 提交 `11cd291`，提交说明 `BE OWNER`。  
 原工作区：`D:\Projects\HSR-OWNER`。文中源码路径相对仓库根目录，迁移目录后仍可使用。
+
+## 0.6 2026-09-25 完整流程验收与提交检查
+
+用户报告完整完成，并要求审查日志、无重大问题则提交。审查 D:/StarRail_Beta/hsr-owner.log 中本次唯一 Resources #1：
+
+- start unix_ms=1790328585013，finished unix_ms=1790329276517，elapsed_ms=691503（约 11 分 32 秒），files_written=64139。IPC 同时记录 dumper finished: Resources (691s)。
+- 游戏目录保留的 version.dll.2257088500 与本地 target/debug/version.dll 的 SHA256 一致：982F37B28EF8C4130094BB1BC517925A591F2193219CD24C9DFB9CBD55F5A760，确认此次验收对应本次构建。
+- TextMap、ExcelOutput、Config（SummonUnit、LevelOutput、VideoCaption、RogueNPC、RogueChestMap、Mission）均有 end 记录。全部日志没有 Error，运行区间没有序列化失败、panic 或内存保护中止记录。
+- 运行期日志采样 private_mib=4983～5386，working_set_mib=3163～3552；available_physical_mib 最低 6288，终态 6336。样本最大值不是操作系统连续测量的精确峰值。
+- 累计 native_calls=206944421；69 条心跳/终态记录中 history_entries 始终 256、history_reserved_bytes 始终 268288（262 KiB）。终态私有提交约 5.26 GiB、工作集约 3.47 GiB，没有原先与调用次数同步的无界增长。
+- 字幕三表按预期跳过 26+21+120=167 条空引用，VideoCaption 62ms 完成；另有 1 条公共入口空路径跳过。
+- 64139 次发布对应 64138 个唯一输出路径；Config/Level/Mission/8013102/Act/Act403055160.json 在两个流程中发布两次。没有发现未清理的 resources-part 临时文件。均匀选取并补充关键类别共 25 个输出检查：24 个 JSON 解析成功，1 个超过 20 MiB 的 TextMap 仅验证存在，没有全量校验每个文件内容。
+
+非阻塞项与覆盖限制：
+
+- 111 条 empty runtime table 警告。导出的是当前运行时表，不能据此保证原始数据为空；表卸载/按分片加载并未实现。
+- 3619 次 ExistsDesignData 返回不存在并跳过；8 种未支持 Manifest 类型的 570 条路径按既有范围跳过。完整 finished 表示既定导出流程完成，不等于所有游戏原始资源无遗漏。
+- 其中一张 Excel 表暴露空路径，按既有命名逻辑生成 ExcelOutput/.json，内容为 []；这是非阻塞的输出命名边界，记录为后续完善项，本次没有在已验收代码上扩大改动。
+- 启动另有 pool1 size pattern not found 警告，表示现有元数据池补丁未匹配；本次没有因此失败，跨版本兼容风险仍保留。GC_DONT_GC 提醒也仍存在，实际 GC 状态未验证，本次没有变更其行为。
+- 详细日志约 133.6 MB，保留当前排查粒度；后续可独立优化日志轮转/级别，不影响本次验收。
+
+提交前检查：复查待提交代码、已有 Dumper 16 项和 IL2CPP 3 项测试通过记录、成功 DLL 构建记录，修改文件 rustfmt 与 git diff --check 通过。本轮仅更新验收文档，没有修改已实测业务代码。审查结果保存在忽略目录 target/resources-validation/completed-run-audit.json，日志与游戏输出不纳入提交。
+
+## 0.5 2026-09-25 第六轮：字幕空引用导致 Invalid path
+
+用户确认新版没有出现内存无限增长，但约 10 分钟后在 Config/VideoCaption 失败。本机日志及输出检查确认：
+
+- Resources #1 elapsed_ms=598810、files_written=37771；错误操作 begin Config: exists 后没有路径，异常 System.Exception，message="Invalid path "。
+- 终态 private_mib=5506、working_set_mib=3576、available_physical_mib=6481（总物理内存 32598 MiB）。native_calls=192324193，history_entries=256、history_reserved_bytes=268288；此前多个心跳历史占用也保持不变。现场结果支持第五轮有界缓存修复有效，不能再说尚未游戏复测。
+- VideoConfig 90 行：26 条空 CaptionPath、64 条非空；CutSceneConfig 41 行：21 条空、20 条非空；LoopCGConfig 138 行：120 条空、18 条非空。共 167 条空引用，三表均没有缺字段、null 或非字符串。
+- 例：VideoConfig 零基 row=3、VideoID=4、CS_Chap01_Act120.usm 的 CaptionPath=""。旧提取逻辑接受空字符串，排序/去重后空值位于第一项，被传给 ExistsDesignData；因此连第一条有效字幕路径都没检查到。
+
+第六轮改动：
+
+- 字幕路径提取跳过空/纯空白字符串，按表名、零基行号、字段、原因打印日志，并输出 rows/caption_paths/skipped_blank 汇总。保留全部非空原始路径，不擅自 trim 改写有效路径。
+- 公共 dump_from_config_list 在任何 IL2CPP 查找或路径检查之前过滤空/纯空白引用，记录 loader 名、输入索引及跳过数，然后正常排序去重；全空列表直接返回，不调用游戏 API。
+- 缺字段、null、非字符串依然报出来源表和行；非空路径的加载异常仍传播，没有 catch 所有 Invalid path 并继续的行为。
+- 维持第五轮有界调用历史、多路径表复用、物理内存保护及第三轮异常详情，没有修改 GC 策略。
+
+验证：cargo test -p dumper --lib --offline：16 项通过，新增字幕混合空值/正常路径、全空、格式错误及公共入口过滤测试；cargo build -p dumper --offline、修改文件 rustfmt、git diff --check 通过。日志在 target/resources-validation/caption-path-{tests,build}.log。新版 target/debug/version.dll 未部署或游戏内运行。
+
+下一步用新版确认日志显示三表合计跳过 167 条空引用并进入字幕加载，再继续 RogueNPC/RogueChestMap/Mission。保留此前 37771 次成功输出，本轮不删除已有文件；完整导出仍待终态 finished 验证。
+
+## 0.4 2026-09-25 第五轮：修复反射调用历史无界增长
+
+用户问“怎么处理”后继续检查，发现比 GC 推测更直接的源码证据：
+
+- crates/il2cpp/src/lib.rs 原 get_native_method 每次执行 LAST_NATIVE_SIGS.lock().unwrap().push(signature.to_string())，全局 Vec<String> 没有容量上限。
+- crates/derive/src/il2cpp_api.rs 生成的反射包装每次调用都会走 get_native_method；序列化不断读取字段、属性、类型，因此历史随操作量持续累积，不随 JSON 写完释放。
+- clear_native_sigs 仅在反射初始化测试期间调用，正常 Resources 导出没有清理。这是已确认的 Rust 保留内存无界增长；不是“所有 JSON 均释放，所以只剩游戏 GC”的情况。
+- 旧历史容器扩容也会导致阶跃式增长。但没有旧版堆快照/历史统计，不能声称现场全部 21 GiB 或某次跳升都由它造成。
+
+已实施：
+
+- 将历史封装到 recent_calls.rs，只保留最近 256 条；每条诊断文本最多 1024 字节，UTF-8 边界截断，循环使用被淘汰条目的 String 缓冲。
+- 实际方法查找始终使用完整原始签名，不受诊断截断影响。recent_native_sigs 保留从旧到新的 Vec<String> 查询接口，clear_native_sigs 释放缓存及重置统计；移除可从外部无界写入的旧全局 Vec。
+- Resources 心跳/终态增加 native_calls、history_entries、history_reserved_bytes；预热后此项应稳定在 256 条和约 268288 字节（262 KiB），不随累计调用次数继续增大。
+- 保留第三/四轮的异常详情、物理内存保护和多路径表复用；未提高限制，未修改 GC 开关或调用卸载方法。
+
+验证：cargo test -p il2cpp -p dumper --lib --offline 共 16 项通过（IL2CPP 3、Dumper 13）。新增百万次记录后容量不增长、最新顺序及长 UTF-8 签名截断测试；cargo build -p dumper --offline、修改文件格式/差异检查通过。日志在 target/resources-validation/native-history-{tests,build}.log。新版 target/debug/version.dll 未部署或游戏内运行。
+
+另查到现场 methods2.json 中存在 GameCoreConfigLoader::UnloadJsonConfig(System.String)、OnConfigUnload() 和 System.GC::GetTotalMemory(System.Boolean)。仅确认接口名称，未分析其共享缓存/引用计数行为，未调用；没有据此实施强制回收或逐文件卸载。GC 引用保护方案暂缓，先验证明确的 Rust 增长点修复收益。
+
+下一步：重启游戏使用新版 DLL 完整导出，确认历史缓存字节数稳定，比较 private_mib/available_physical_mib 曲线与最终 finished/failed。若仍持续上涨，再依据分阶段增量定位托管堆/加载器缓存；GC_DONT_GC 实际效果仍待运行时验证，不能继续当作已确认主因。
+
+## 0.3 2026-09-25 第四轮：Config 内存保护与物理内存压力
+
+用户提供第三轮新版日志，并指出失败前任务管理器内存 100%，HSR 占十多个 GiB。现场 hsr-owner.log 确认：
+
+- 本次越过之前的 ExcelOutput 故障；341838ms、6056 次成功文件发布后，在 LoadLevelFloorCrossMapBriefInfo 的 CrossMapBriefInfo_P20432_F20432001.json 序列化中触发保护。
+- 1790326353913 心跳 private_mib=14954、working_set_mib=11517；1790326363917 首次采样超限 private_mib=21280、working_set_mib=9592、available_commit_mib=24853；1790326365581 返回 Failed。
+- 这是保护性停止，不是本次已证实的分配失败/OOM 崩溃。旧日志没采集可用物理内存，不能用 available_commit_mib 否定用户观察的 RAM 100%；提交额度含页面文件，与可用物理内存不同（[Microsoft MEMORYSTATUSEX 文档](https://learn.microsoft.com/zh-cn/windows/win32/api/sysinfoapi/ns-sysinfoapi-memorystatusex)）。
+- 旧检查是时间采样加协作退出，不能抢占原生调用；第一次采到的值可能已显著越界。16 GiB 不是操作系统强制分配上限，不能宣称新增检查保证零超调。
+
+源码确认与限制：
+
+- Config 每个文件的 serde_json::Value、缓冲 writer 离开作用域即释放；没有把所有 Config JSON 留在 Rust 容器里。但释放后分配器是否马上归还系统不可保证。
+- 反射会创建托管临时对象，游戏加载器也可能持有缓存；Il2CppObject 是地址包装，Rust drop 不能回收其指向的托管对象。
+- dumper/src/lib.rs 启动时设置 GC_DONT_GC=1，这是禁用回收的明显疑点；当前没有验证游戏实际 GC 状态、堆增长组成或加载器缓存持有关系。现有 Rust 容器中的托管地址没有统一 GC 句柄保护，本轮未改 GC 设置，未强制回收游戏对象。
+
+第四轮实施：
+
+- 内存日志增加 available_physical_mib、total_physical_mib。可用物理内存不高于 max(1 GiB, 总 RAM 的 5%) 时请求停止，保留 16 GiB 私有提交/2 GiB 提交余量原阈值。
+- 序列化检查采样间隔降至 100ms，独立监视线程每 250ms 检查、约 10 秒心跳。每个 operation 前后强制采样；成功结束日志加 private_delta_mib，终态刷新实际采样但保留首次停止原因。原生调用无法抢占的限制仍在。
+- 同一 Excel 类型的多条路径以前会重复序列化同一运行时表；现在只生成一次，其他不同输出名以 64 KiB 块复制，并检查内存。明确采用同一时刻的表快照，仍未实现每个原始分片独立加载；已知多路径完整性限制不因此消失。
+- 复制依然写临时文件后发布，失败保留旧目标；重复输出名不重复发布。开始时记录 GC_DONT_GC 环境变量及“实际 GC 状态未验证”。
+
+验证：cargo test -p dumper --lib --offline：13 项通过，新增物理内存阈值边界检查及复制成功/失败保留文件验证；cargo build -p dumper --offline、rustfmt、git diff --check 通过。日志为 target/resources-validation/physical-memory-{tests,build}.log。新版 target/debug/version.dll 未部署到游戏目录，未游戏内运行。
+
+下一步应比较新日志中加载/序列化的 private_delta_mib、物理内存余量和多路径复用节省；若仍增长，需验证实际 GC 状态与托管引用保护、加载器缓存生命周期。新增保护可能使任务更早 Failed，不能把它当作“释放内存已完成”或保证全量导出。
+
+## 0.2 2026-09-25 第三轮：MoveNext 托管异常
+
+本轮开始基线 fb0c88b，工作区干净。读取用户提供的错误及 D:/StarRail_Beta/hsr-owner.log，确认：
+
+- Resources #1 于 Unix 毫秒 1790325473529 开始，1790325562622 失败；elapsed_ms=89092，files_written=1985。
+- 失败表为 OKNONGBAAEM，路径 BakedConfig/ExcelOutputGameCore/SpecialAvatarRelicMainValue.bytes，操作 MoveNext，row=14715 是已成功发出的行数（下一次 MoveNext 的零基索引），不是定位到某个坏数据行的证据。
+- 本表约 1.36 秒内已处理 14715 行。错误为 IL2CPP invocation raised exception at 0x700F33442D0；旧日志只有地址，不能确认异常类型、集合版本冲突或数据加载故障。
+- 最终 private_mib=9076、working_set_mib=6425、available_commit_mib=36664，未达到保护阈值。本次是托管调用返回错误，日志在 Failed 后仍持续产生，不等同于上一轮 OOM 崩溃。
+- 1985 是本次成功发布文件的次数；失败表临时文件被清理，旧同名文件如存在会保留，不能视为本轮成功产物。Config 阶段未执行。
+
+本轮改动：
+
+- Resources 的调用异常不再只打印地址：通过已有原生元数据 API 读取类型和 System.Exception 存储消息字段，不调用异常 getter、ToString 或原有带 unwrap 的 Debug 实现。
+- 诊断读取限制元数据长度、消息长度和基类遍历层数；SEH 及内部 Rust panic 捕获失败时退回地址与详情不可用说明，保留原异常。消息字段布局不兼容时仍尽可能保留类型。
+- 表枚举器工厂限定为静态零参数方法。从实际枚举器类型查 Current/MoveNext；值类型通过已有 object_unbox API 取调用地址，引用类型保留对象地址，替代无条件 +16。记录工厂名、实际类型、value_type 和 MoveNext RVA，并检查空返回。
+- 这些是诊断及调用兼容性修正，**尚不能证明本次 MoveNext 异常已修复**。保留流式输出和遇错停止，没有盲目重试、跳过错误或关闭内存保护。
+
+验证：cargo test -p dumper --lib --offline：12 项通过，新增异常详情成功、读取失败、诊断 panic、空指针退化覆盖；cargo build -p dumper --offline 通过。日志在 target/resources-validation/movenext-{tests,build}.log。新版 target/debug/version.dll 尚未部署或游戏内运行。
+
+下一步：复测新版，读取同一失败位置的 type、message、enumerator 信息，再决定是否是集合变更需快照/受控重试，还是加载/类型适配问题。当前不能给出确证根因或保证完整导出。
 
 ## 0.1 2026-09-25 第二轮：导出期间游戏崩溃
 
@@ -247,4 +358,4 @@
 | 2026-09-24 | 全项目与 Resources 静态分析 | 文档已生成，业务源码未修改，未编译/运行 | 获取实际卡住阶段 |
 | 2026-09-24 | 用户补充症状并要求跨对话保存 | Resources 长期 Running，工具界面可操作；用户暂时不能排查 | 等用户新对话恢复，先读交接再核对代码与 Console 日志 |
 
-当前最优先的下一步：**使用第二轮版本复测并观察 private_mib / available_commit_mib，确认完整导出或明确内存保护 Failed；已知旧版现场 OOM，不能再当作单纯等待问题。**
+当前状态：**第 0.6 节已记录完整流程验收，原任务可收尾。后续只有用户继续要求时再处理原始分片完整性、空表来源、输出命名或日志体积；不要把历史故障重新当作当前阻塞。**

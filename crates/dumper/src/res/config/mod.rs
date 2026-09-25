@@ -122,11 +122,10 @@ fn read_excel(name: &str) -> Result<Vec<serde_json::Value>> {
 
 fn dump_from_config_list(
     func_name: &str,
-    mut paths: Vec<String>,
+    paths: Vec<String>,
     serializer: &mut BoxedSerializer,
 ) -> Result<()> {
-    paths.sort();
-    paths.dedup();
+    let paths = prepare_config_paths(func_name, paths);
     checkpoint(format!("Config: {func_name} paths={}", paths.len()));
     if paths.is_empty() {
         return Ok(());
@@ -189,9 +188,36 @@ fn dump_from_config_list(
     Ok(())
 }
 
+fn prepare_config_paths(func_name: &str, paths: Vec<String>) -> Vec<String> {
+    let input_count = paths.len();
+    let mut skipped_blank = 0;
+    let mut paths: Vec<_> = paths
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, path)| {
+            if path.trim().is_empty() {
+                skipped_blank += 1;
+                checkpoint(format!(
+                    "Config: {func_name} skip blank path input_index={index} path={path:?}"
+                ));
+                None
+            } else {
+                Some(path)
+            }
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    checkpoint(format!(
+        "Config: {func_name} input_paths={input_count} unique_paths={} skipped_blank={skipped_blank}",
+        paths.len()
+    ));
+    paths
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_manifest;
+    use super::{parse_manifest, prepare_config_paths};
     use serde_json::json;
 
     #[test]
@@ -214,5 +240,22 @@ mod tests {
             parse_manifest(json!([{"type": "A", "paths": 42}]), "type", "paths").unwrap_err();
         assert!(format!("{error:#}").contains("item 0"));
         assert!(format!("{error:#}").contains("paths"));
+    }
+
+    #[test]
+    fn loader_paths_exclude_blank_references_before_any_game_call() {
+        let paths = [
+            "",
+            "\t ",
+            "Config/b.json",
+            "Config/a.json",
+            "Config/b.json",
+            " Config/raw.json ",
+        ];
+        assert_eq!(
+            prepare_config_paths("TestLoader", paths.map(str::to_owned).to_vec()),
+            [" Config/raw.json ", "Config/a.json", "Config/b.json"]
+        );
+        assert!(prepare_config_paths("TestLoader", vec![String::new(), " \r\n".into()]).is_empty());
     }
 }

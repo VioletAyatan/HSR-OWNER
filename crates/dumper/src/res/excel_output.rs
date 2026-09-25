@@ -38,6 +38,8 @@ fn dump_table(table: RuntimeType) -> Result<()> {
     let value = paths_field.get_value(Il2CppObject::NULL)?;
     ensure!(value.0 != 0, "{name}: null path list");
     let paths = Il2CppArray(value.0).to_vec::<Il2CppString>();
+    let mut snapshot: Option<PathBuf> = None;
+    let mut outputs = std::collections::HashSet::new();
     for path in paths {
         ensure!(path.0 != 0, "{name}: null path in path list");
         let path = path.as_str();
@@ -45,7 +47,25 @@ fn dump_table(table: RuntimeType) -> Result<()> {
         let output_name = path.rsplit('/').next().unwrap_or(&path);
         let output_name = output_name.strip_suffix(".bytes").unwrap_or(output_name);
         let output = PathBuf::from(format!("./DUMP/Resources/ExcelOutput/{output_name}.json"));
-        super::write_table(table, &format!("{name} path={path}"), &output)?;
+        if !outputs.insert(output.clone()) {
+            continue;
+        }
+        if let Some(source) = &snapshot {
+            super::operation(
+                format!(
+                    "ExcelOutput: reuse runtime table {name} -> {}",
+                    output.display()
+                ),
+                || {
+                    super::json_output::copy(source, &output)?;
+                    super::diagnostics::file_written();
+                    Ok(())
+                },
+            )?;
+        } else {
+            super::write_table(table, &format!("{name} path={path}"), &output)?;
+            snapshot = Some(output);
+        }
     }
     Ok(())
 }

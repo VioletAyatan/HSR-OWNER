@@ -32,6 +32,11 @@ impl Session {
     pub(super) fn start() -> Result<Self> {
         let root = std::env::current_dir().context("resolve Resources output directory")?;
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        if let Some(value) = std::env::var_os("GC_DONT_GC") {
+            log::warn!(
+                "[Resources #{id}] GC_DONT_GC={value:?}; environment requests disabled collection; actual runtime GC state is unverified, managed temporary objects may accumulate"
+            );
+        }
         let memory = Arc::new(super::memory::Monitor::new()?);
         let state = Arc::new(Mutex::new(State {
             id,
@@ -44,13 +49,13 @@ impl Session {
         let watched = state.clone();
         std::thread::Builder::new().name(format!("resources-watch-{id}")).spawn(move || {
             let mut ticks = 0;
-            while matches!(rx.recv_timeout(Duration::from_secs(1)), Err(mpsc::RecvTimeoutError::Timeout)) {
+            while matches!(rx.recv_timeout(Duration::from_millis(250)), Err(mpsc::RecvTimeoutError::Timeout)) {
                 let _ = memory.check();
                 ticks += 1;
-                if ticks % 10 != 0 { continue; }
+                if ticks % 40 != 0 { continue; }
                 let state = watched.lock().unwrap_or_else(|e| e.into_inner());
-                log::info!("[Resources #{id}] heartbeat operation={} operation_elapsed_ms={} files_written={} {}",
-                    state.current, state.since.elapsed().as_millis(), state.files, memory.summary());
+                log::info!("[Resources #{id}] heartbeat operation={} operation_elapsed_ms={} files_written={} {} {}",
+                    state.current, state.since.elapsed().as_millis(), state.files, memory.summary(), native_history_summary());
             }
         }).context("start Resources diagnostics")?;
         ACTIVE.with(|active| *active.borrow_mut() = Some(state.clone()));
@@ -81,10 +86,12 @@ impl Session {
 
     pub(super) fn finish(&self, result: &Result<()>) {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = state.memory.sample(true);
         log::info!(
-            "[Resources #{}] final memory {}",
+            "[Resources #{}] final memory {} {}",
             state.id,
-            state.memory.summary()
+            state.memory.summary(),
+            native_history_summary()
         );
         match result {
             Ok(()) => log::info!(
@@ -102,6 +109,14 @@ impl Session {
             ),
         }
     }
+}
+
+fn native_history_summary() -> String {
+    let stats = il2cpp::native_call_history_stats();
+    format!(
+        "native_calls={} history_entries={} history_reserved_bytes={}",
+        stats.calls, stats.retained, stats.reserved_bytes
+    )
 }
 
 impl Drop for Session {
@@ -160,14 +175,42 @@ pub(super) fn check_memory() -> Result<()> {
 pub(super) fn operation<T>(label: impl Into<String>, run: impl FnOnce() -> Result<T>) -> Result<T> {
     let label = label.into();
     checkpoint(format!("begin {label}"));
-    check_memory().with_context(|| label.clone())?;
+    let before = sample_memory().with_context(|| label.clone())?;
     let start = Instant::now();
     let result = run().with_context(|| label.clone());
+    let after = sample_memory();
     if result.is_ok() {
+        let after = after.with_context(|| format!("after {label}"))?;
+        let memory = before
+            .zip(after)
+            .map(|(before, after)| {
+                format!(
+                    " private_delta_mib={} {}",
+                    (after.private_bytes as i64 - before.private_bytes as i64) / (1024 * 1024),
+                    after.summary()
+                )
+            })
+            .unwrap_or_default();
         checkpoint(format!(
-            "end {label} elapsed_ms={}",
+            "end {label} elapsed_ms={}{memory}",
             start.elapsed().as_millis()
         ));
     }
     result
+}
+
+fn sample_memory() -> Result<Option<super::memory::Snapshot>> {
+    ACTIVE.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .memory
+                    .sample(true)
+            })
+            .transpose()
+    })
 }

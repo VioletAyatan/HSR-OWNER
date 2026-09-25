@@ -8,10 +8,12 @@ mod config;
 mod diagnostics;
 mod excel_output;
 mod json_output;
+mod managed_error;
 mod memory;
 mod textmap;
 
 use diagnostics::{checkpoint, operation};
+use managed_error::invoke_error;
 
 fn manifest_fields() -> Result<(String, String)> {
     checkpoint("Config: resolve manifest fields");
@@ -147,11 +149,6 @@ pub fn dump() -> Result<()> {
     result
 }
 
-/// Do not invoke managed exception getters while reporting a failed native call.
-fn invoke_error(error: il2cpp::vm::exception::Il2CppException) -> anyhow::Error {
-    anyhow::anyhow!("IL2CPP invocation raised exception at 0x{:X}", error.0)
-}
-
 fn write_json(path: &std::path::Path, value: &impl serde::Serialize) -> Result<()> {
     operation(format!("stream JSON {}", path.display()), || {
         json_output::value(path, value)?;
@@ -190,27 +187,45 @@ fn table_rows(
             .get_methods_il2cpp()
             .into_iter()
             .find(|method| {
+                let native = method.get_il2cpp_method();
+                if il2cpp::api::il2cpp_method_is_instance(native)
+                    || il2cpp::api::il2cpp_method_get_param_count(native) != 0
+                {
+                    return false;
+                }
                 method.get_return_type().is_ok_and(|ty| {
                     ty.get_name()
                         .is_ok_and(|name| name.as_str().contains("Enumerator"))
                 })
             })
-            .with_context(|| format!("{label}: no Enumerator method"))?;
-        let current = get_enumerator
-            .get_return_type()?
-            .get_property("Current".into(), 62)?;
-        ensure!(!current.is_null(), "{label}: missing Current property");
-        let row_type = current.get_property_type()?;
+            .with_context(|| format!("{label}: no static zero-argument Enumerator method"))?;
         checkpoint(format!("{label}: invoke GetEnumerator"));
         let enumerator = get_enumerator
             .get_il2cpp_method()
             .invoke::<Il2CppObject>(Il2CppObject::NULL, &[])
             .map_err(invoke_error)?;
         ensure!(enumerator.0 != 0, "{label}: null enumerator");
-        let move_next = RuntimeType::from_object(enumerator)?
+        let enumerator_type = RuntimeType::from_object(enumerator)?;
+        let current = enumerator_type.get_property("Current".into(), 62)?;
+        ensure!(!current.is_null(), "{label}: missing Current property");
+        let row_type = current.get_property_type()?;
+        let is_value_type = il2cpp::api::il2cpp_class_is_valuetype(enumerator.get_class());
+        let receiver = if is_value_type {
+            Il2CppObject(il2cpp::api::il2cpp_object_unbox(enumerator) as usize)
+        } else {
+            enumerator
+        };
+        ensure!(receiver.0 != 0, "{label}: null enumerator receiver");
+        let move_next = enumerator_type
             .find_method_il2cpp("MoveNext")
             .with_context(|| format!("{label}: missing MoveNext"))?
             .get_il2cpp_method();
+        checkpoint(format!(
+            "{label}: enumerator factory={} type={} value_type={is_value_type} MoveNext_rva=0x{:X}",
+            get_enumerator.get_il2cpp_method().get_name(),
+            enumerator_type.il_name(),
+            move_next.rva()
+        ));
         checkpoint(format!("{label}: initialize serializer"));
         let mut serializer = new_serializer();
         let mut count = 0;
@@ -218,12 +233,15 @@ fn table_rows(
             diagnostics::check_memory()?;
             let index = count;
             diagnostics::row_checkpoint(label, index, "MoveNext");
-            if !move_next
-                .invoke::<BoxedBool>(Il2CppObject(enumerator.0 + 16), &[])
+            let has_next = move_next
+                .invoke::<BoxedBool>(receiver, &[])
                 .map_err(invoke_error)
-                .with_context(|| format!("{label} row {index}: MoveNext"))?
-                .unbox()
-            {
+                .with_context(|| format!("{label} row {index}: MoveNext"))?;
+            ensure!(
+                has_next.0 != 0,
+                "{label} row {index}: MoveNext returned null"
+            );
+            if !has_next.unbox() {
                 break;
             }
             diagnostics::row_checkpoint(label, index, "Current");

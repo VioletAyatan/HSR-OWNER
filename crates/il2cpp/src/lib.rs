@@ -12,8 +12,12 @@ pub mod api_table;
 pub mod vm;
 
 mod api_init;
+mod recent_calls;
 
 pub use api_init::init_il2cpp;
+pub use recent_calls::{
+    NativeCallHistoryStats, clear_native_sigs, native_call_history_stats, recent_native_sigs,
+};
 
 pub static GA_BASE: LazyLock<usize> = LazyLock::new(|| unsafe {
     GetModuleHandleW(w!("GameAssembly"))
@@ -108,21 +112,9 @@ pub fn get_cached_class(name: &str) -> Option<Il2CppClass> {
 
 pub static FIX_METHOD_INDEX_MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-pub static LAST_NATIVE_SIGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-#[inline]
-pub fn recent_native_sigs() -> Vec<String> {
-    LAST_NATIVE_SIGS.lock().unwrap().clone()
-}
-
-#[inline]
-pub fn clear_native_sigs() {
-    LAST_NATIVE_SIGS.lock().unwrap().clear();
-}
-
 #[inline]
 pub fn get_native_method(signature: &str) -> Option<Il2CppMethod> {
-    LAST_NATIVE_SIGS.lock().unwrap().push(signature.to_string());
+    recent_calls::record(signature);
 
     let corrected = FIX_METHOD_INDEX_MAP
         .get_or_init(|| Mutex::new(HashMap::new()))
