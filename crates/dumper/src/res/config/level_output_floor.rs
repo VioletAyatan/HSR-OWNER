@@ -1,27 +1,29 @@
+use anyhow::{Context, Result};
 use reflection::serializer::BoxedSerializer;
-use serde_json::{Map, Value};
-use std::{cell::RefCell, fs, rc::Rc};
+use serde_json::Value;
+use std::{cell::RefCell, rc::Rc};
 
-pub fn dump(serializer: &mut BoxedSerializer) {
-    let maze_plane: Vec<Map<String, Value>> =
-        serde_json::from_slice(&fs::read("./DUMP/Resources/ExcelOutput/MazePlane.json").unwrap())
-            .unwrap();
+pub fn dump(serializer: &mut BoxedSerializer) -> Result<()> {
+    let maze_plane = super::read_excel("MazePlane")?;
 
-    let paths: Vec<_> = maze_plane
+    let paths: Result<Vec<_>> = maze_plane
         .iter()
-        .flat_map(|p| {
-            let list = p
-                .get("FloorIDList")
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_u64().unwrap() as u32)
-                .collect::<Vec<_>>();
-            let plane_id = p.get("PlaneID").unwrap().as_u64().unwrap() as u32;
-            list.into_iter().map(move |f| (plane_id, f))
+        .enumerate()
+        .map(|(index, p)| {
+            let plane_id = p.get("PlaneID").and_then(Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok())
+                .with_context(|| format!("MazePlane row {index} has invalid PlaneID"))?;
+            let floor_ids = p.get("FloorIDList").and_then(Value::as_array)
+                .with_context(|| format!("MazePlane row {index} has invalid FloorIDList"))?;
+            floor_ids.iter().enumerate().map(|(floor_index, value)| {
+                value.as_u64().and_then(|id| u32::try_from(id).ok())
+                    .map(|floor_id| (plane_id, floor_id))
+                    .with_context(|| format!("MazePlane row {index} FloorIDList[{floor_index}] is not a valid u32 ID"))
+            }).collect::<Result<Vec<_>>>()
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()
+        .map(|rows| rows.into_iter().flatten().collect());
+    let paths = paths?;
 
     let group_paths = Rc::new(RefCell::new(Vec::<String>::new()));
     let group_paths_clone = group_paths.clone();
@@ -62,18 +64,19 @@ pub fn dump(serializer: &mut BoxedSerializer) {
         navmap_paths.push(format!("Config/LevelOutput/Map/MapInfo_{name}.json"));
     }
 
-    super::dump_from_config_list("LoadRtLevelFloorInfo", rt_level_floor_paths, serializer);
-    super::dump_from_config_list("LoadLevelFloorBakedInfo", baked_floor_paths, serializer);
+    super::dump_from_config_list("LoadRtLevelFloorInfo", rt_level_floor_paths, serializer)?;
+    super::dump_from_config_list("LoadLevelFloorBakedInfo", baked_floor_paths, serializer)?;
     super::dump_from_config_list(
         "LoadLevelFloorCrossMapBriefInfo",
         cross_map_brief_paths,
         serializer,
-    );
-    super::dump_from_config_list("LoadLevelRegionInfos", region_paths, serializer);
-    super::dump_from_config_list("LoadMapRotationConfig", rotation_paths, serializer);
-    super::dump_from_config_list("LoadEraFlipperConfig", era_flipper_paths, serializer);
-    super::dump_from_config_list("LoadLevelNavmapConfig", navmap_paths, serializer);
-    super::dump_from_config_list("LoadRtLevelGroupInfo", group_paths.take(), serializer);
+    )?;
+    super::dump_from_config_list("LoadLevelRegionInfos", region_paths, serializer)?;
+    super::dump_from_config_list("LoadMapRotationConfig", rotation_paths, serializer)?;
+    super::dump_from_config_list("LoadEraFlipperConfig", era_flipper_paths, serializer)?;
+    super::dump_from_config_list("LoadLevelNavmapConfig", navmap_paths, serializer)?;
+    super::dump_from_config_list("LoadRtLevelGroupInfo", group_paths.take(), serializer)?;
 
     serializer.remove_callback("GroupPath");
+    Ok(())
 }

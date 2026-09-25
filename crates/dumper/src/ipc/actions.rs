@@ -6,6 +6,9 @@ use crate::{csharp, parser_data, proto, res, runtime, script, script_v2};
 
 pub fn run(action: DumperAction) -> anyhow::Result<()> {
     ensure_dump_folder()?;
+    if action == DumperAction::Resources {
+        return res::dump();
+    }
     runtime::init_default();
     runtime::attach_current_thread_to_il2cpp();
 
@@ -15,7 +18,7 @@ pub fn run(action: DumperAction) -> anyhow::Result<()> {
         DumperAction::ParserData => parser_data::dump(),
         DumperAction::Script => script::dump(),
         DumperAction::ScriptV2 => script_v2::dump(),
-        DumperAction::Resources => res::dump(),
+        DumperAction::Resources => unreachable!("Resources has its own diagnostic boundary"),
     }
 
     Ok(())

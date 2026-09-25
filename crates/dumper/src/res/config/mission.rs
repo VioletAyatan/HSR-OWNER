@@ -1,59 +1,63 @@
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
+use anyhow::{Context, Result};
 use reflection::serializer::BoxedSerializer;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-fn read_performance(name: &str, out: &mut HashSet<String>) {
-    let entries = serde_json::from_slice::<Vec<Value>>(
-        &std::fs::read(format!("./DUMP/Resources/ExcelOutput/{name}.json")).unwrap(),
-    )
-    .unwrap();
+fn read_performance(name: &str, out: &mut HashSet<String>) -> Result<()> {
+    let entries = super::read_excel(name)?;
 
-    for item in entries {
-        let Some(Value::String(performance_path)) =
-            item.get("PerformancePath").or_else(|| item.get("ActPath"))
-        else {
-            continue;
-        };
-        out.insert(performance_path.to_string());
+    for (index, item) in entries.iter().enumerate() {
+        let path = item
+            .get("PerformancePath")
+            .or_else(|| item.get("ActPath"))
+            .and_then(Value::as_str)
+            .with_context(|| {
+                format!("{name} row {index} has neither a valid PerformancePath nor ActPath")
+            })?;
+        out.insert(path.to_owned());
     }
+    Ok(())
 }
 
-fn dump_level_graphs(serializer: &mut BoxedSerializer) {
+fn dump_level_graphs(serializer: &mut BoxedSerializer) -> Result<()> {
     let mut performances = HashSet::new();
-    read_performance("PerformanceA", &mut performances);
-    read_performance("PerformanceC", &mut performances);
-    read_performance("PerformanceCG", &mut performances);
-    read_performance("PerformanceD", &mut performances);
-    read_performance("PerformanceDS", &mut performances);
-    read_performance("PerformanceE", &mut performances);
-    read_performance("PerformanceVideo", &mut performances);
-    read_performance("DialogueNPC", &mut performances);
+    for name in [
+        "PerformanceA",
+        "PerformanceC",
+        "PerformanceCG",
+        "PerformanceD",
+        "PerformanceDS",
+        "PerformanceE",
+        "PerformanceVideo",
+        "DialogueNPC",
+    ] {
+        read_performance(name, &mut performances).with_context(|| format!("reading {name}"))?;
+    }
     super::dump_from_config_list(
         "LoadLevelGraphConfig",
         performances.into_iter().collect(),
         serializer,
-    );
+    )?;
+    Ok(())
 }
 
-fn dump_mission_info(serializer: &mut BoxedSerializer) {
-    let chess_board_data: Vec<Map<String, Value>> = serde_json::from_slice(
-        &std::fs::read("./DUMP/Resources/ExcelOutput/MainMission.json").unwrap(),
-    )
-    .unwrap();
+fn dump_mission_info(serializer: &mut BoxedSerializer) -> Result<()> {
+    let chess_board_data = super::read_excel("MainMission")?;
 
     let main_mission_paths = chess_board_data
         .iter()
-        .filter_map(|data| {
-            if let Some(Value::Number(mission_id)) = data.get("MainMissionID") {
-                Some(format!(
-                    "Config/Level/Mission/{mission_id}/MissionInfo_{mission_id}.json"
-                ))
-            } else {
-                None
-            }
+        .enumerate()
+        .map(|(index, data)| {
+            let mission_id = data
+                .get("MainMissionID")
+                .and_then(Value::as_u64)
+                .with_context(|| format!("MainMission row {index} has invalid MainMissionID"))?;
+            Ok(format!(
+                "Config/Level/Mission/{mission_id}/MissionInfo_{mission_id}.json"
+            ))
         })
-        .collect::<HashSet<_>>();
+        .collect::<Result<HashSet<_>>>()?;
 
     let sub_mission_paths = Rc::new(RefCell::new(Vec::<String>::new()));
     let sub_mission_paths_clone = sub_mission_paths.clone();
@@ -71,14 +75,16 @@ fn dump_mission_info(serializer: &mut BoxedSerializer) {
         "LoadMainMissionInfoConfig",
         main_mission_paths.into_iter().collect(),
         serializer,
-    );
+    )?;
 
     serializer.remove_callback("MissionJsonPath");
 
-    super::dump_from_config_list("LoadLevelGraphConfig", sub_mission_paths.take(), serializer);
+    super::dump_from_config_list("LoadLevelGraphConfig", sub_mission_paths.take(), serializer)?;
+    Ok(())
 }
 
-pub fn dump(serializer: &mut BoxedSerializer) {
-    dump_mission_info(serializer);
-    dump_level_graphs(serializer);
+pub fn dump(serializer: &mut BoxedSerializer) -> Result<()> {
+    dump_mission_info(serializer)?;
+    dump_level_graphs(serializer)?;
+    Ok(())
 }

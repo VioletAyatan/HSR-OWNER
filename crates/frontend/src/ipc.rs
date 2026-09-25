@@ -71,6 +71,11 @@ pub fn request(command: FrontendCommand, timeout: Duration) -> Result<BackendEve
     CLIENT.request(command, timeout)
 }
 
+/// Dumper launches must fail visibly instead of waiting in the reconnect queue.
+pub fn send_dumper(action: hsr_ipc::DumperAction) -> Result<()> {
+    CLIENT.send(FrontendCommand::RunDumper { action })
+}
+
 pub fn subscribe() -> Receiver<BackendEvent> {
     CLIENT.subscribe()
 }

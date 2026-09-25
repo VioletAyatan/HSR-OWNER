@@ -1,6 +1,15 @@
 use crate::vm::value::Il2CppValue;
 use crate::{api, vm::class::Il2CppClass};
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
+// The IL2CPP name API returns a native-allocated C string and this binding exposes no
+// matching release function. Keep one returned name for each runtime type pointer for
+// the lifetime of this process; this assumes the active game's type pointers stay valid.
+static TYPE_NAMES: OnceLock<Mutex<HashMap<usize, &'static str>>> = OnceLock::new();
 
 #[repr(u32)]
 pub enum Il2CppTypeNameFormat {
@@ -34,7 +43,21 @@ impl Il2CppType {
     #[inline]
     /// TODO: Not actually using the formatting
     pub fn get_name(&self, format: Il2CppTypeNameFormat) -> Cow<'static, str> {
-        unsafe { utils::cstr_to_str(api::il2cpp_type_get_name(*self)) }
+        let names = TYPE_NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut names = names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(name) = names.get(&self.0) {
+            return Cow::Borrowed(name);
+        }
+
+        let name = unsafe { utils::cstr_to_str(api::il2cpp_type_get_name(*self)) };
+        let name = match name {
+            Cow::Borrowed(name) => name,
+            Cow::Owned(name) => Box::leak(name.into_boxed_str()),
+        };
+        names.insert(self.0, name);
+        Cow::Borrowed(name)
     }
 }
 
@@ -44,13 +67,6 @@ impl Il2CppValue for Il2CppType {
     }
 
     fn as_raw(&self) -> usize {
-        #[derive(Debug, Clone, Copy)]
-        #[repr(C)]
-        struct RuntimeTypeHandle {
-            pub pointer: usize,
-        }
-        let boxed = Box::new(RuntimeTypeHandle { pointer: self.0 });
-        let ptr = Box::into_raw(boxed);
-        ptr as usize
+        &self.0 as *const usize as usize
     }
 }

@@ -1,23 +1,23 @@
+use anyhow::{Context, Result};
 use reflection::serializer::BoxedSerializer;
-use serde_json::{Map, Value};
-use std::fs;
+use serde_json::Value;
 
-pub fn dump(serializer: &mut BoxedSerializer) {
-    let chess_board_data: Vec<Map<String, Value>> = serde_json::from_slice(
-        &fs::read("./DUMP/Resources/ExcelOutput/RogueDLCChessBoard.json").unwrap(),
-    )
-    .unwrap();
+pub fn dump(serializer: &mut BoxedSerializer) -> Result<()> {
+    let chess_board_data = super::read_excel("RogueDLCChessBoard")?;
 
-    let paths: Vec<_> = chess_board_data
+    let paths: Result<Vec<_>> = chess_board_data
         .iter()
-        .map(|data| {
+        .enumerate()
+        .map(|(index, data)| {
             data.get("ChessBoardConfiguration")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_string()
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .with_context(|| {
+                    format!("RogueDLCChessBoard row {index} has invalid ChessBoardConfiguration")
+                })
         })
         .collect();
 
-    super::dump_from_config_list("LoadRogueChestMapConfig", paths, serializer);
+    super::dump_from_config_list("LoadRogueChestMapConfig", paths?, serializer)?;
+    Ok(())
 }

@@ -97,13 +97,6 @@ impl Il2CppMethod {
 
 impl Il2CppValue for Il2CppMethod {
     fn as_raw(&self) -> usize {
-        #[derive(Debug, Clone, Copy)]
-        #[repr(C)]
-        struct RuntimeMethodInfo {
-            pub pointer: usize,
-        }
-        let boxed = Box::new(RuntimeMethodInfo { pointer: self.0 });
-        let ptr = Box::into_raw(boxed);
-        ptr as usize
+        &self.0 as *const usize as usize
     }
 }

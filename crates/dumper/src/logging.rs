@@ -58,14 +58,20 @@ impl log::Log for IpcLogger {
 pub fn init() -> mpsc::Receiver<LogEntry> {
     let (tx, rx) = mpsc::sync_channel(8192);
     *LOG_SENDER.lock().unwrap() = Some(tx);
-    *LOG_FILE.lock().unwrap() = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("hsr-owner.log")
-        .ok();
+        .open("hsr-owner.log");
 
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Debug);
+    }
+
+    match file {
+        Ok(file) => *LOG_FILE.lock().unwrap() = Some(file),
+        Err(error) => {
+            log::warn!("[Logging] cannot open hsr-owner.log; Console logging only: {error}")
+        }
     }
 
     capture_stdout_stderr();

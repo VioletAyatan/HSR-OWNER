@@ -1,34 +1,52 @@
 use gpui::{prelude::FluentBuilder as _, *};
 use gpui_component::{
-    ActiveTheme, Sizable as _,
+    ActiveTheme, Disableable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
-use hsr_ipc::{BackendEvent, DumperAction, FrontendCommand, ProtoDumpMode};
+use hsr_ipc::{BackendEvent, DumperAction, ProtoDumpMode};
 
 pub struct DumperPage {
     proto_mode: ProtoDumpMode,
     status: Option<String>,
+    active: Option<DumperAction>,
 }
 
 impl DumperPage {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         crate::ui::spawn_event_bridge(cx, |this, event, _cx| match event {
             BackendEvent::DumperStarted { action } => {
+                this.active = Some(*action);
                 this.status = Some(format!("Running {}…", action.label()));
             }
             BackendEvent::DumperFinished { action, seconds } => {
+                this.active = None;
                 this.status = Some(format!("{} finished in {seconds}s", action.label()));
             }
             BackendEvent::DumperFailed { action, error } => {
+                this.active = None;
                 this.status = Some(format!("{} failed: {error}", action.label()));
             }
             _ => {}
         });
 
+        cx.spawn(async move |this, cx| {
+            loop {
+                smol::Timer::after(std::time::Duration::from_millis(250)).await;
+                if this.update(cx, |this, cx| {
+                    if this.active.is_some() && !crate::ipc::is_connected() {
+                        this.active = None;
+                        this.status = Some("Connection lost; backend dump may still be running. Check hsr-owner.log.".into());
+                        cx.notify();
+                    }
+                }).is_err() { break; }
+            }
+        }).detach();
+
         Self {
             proto_mode: ProtoDumpMode::WriteTo,
             status: None,
+            active: None,
         }
     }
 
@@ -46,7 +64,12 @@ impl DumperPage {
                     .child(
                         v_flex()
                             .gap_1()
-                            .child(div().font_weight(FontWeight::BOLD).text_color(cx.theme().foreground).child(action.label()))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(cx.theme().foreground)
+                                    .child(action.label()),
+                            )
                             .child(
                                 div()
                                     .text_sm()
@@ -58,7 +81,11 @@ impl DumperPage {
                         Button::new(dump_id)
                             .custom(crate::components::ui::gold_button_variant(cx))
                             .label("Dump")
-                            .on_click(cx.listener(move |this, _, _, _cx| {
+                            .disabled(self.active.is_some())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.active.is_some() {
+                                    return;
+                                }
                                 let action = if matches!(action, DumperAction::Proto { .. }) {
                                     DumperAction::Proto {
                                         mode: this.proto_mode,
@@ -66,7 +93,28 @@ impl DumperPage {
                                 } else {
                                     action
                                 };
-                                crate::ipc::send(FrontendCommand::RunDumper { action });
+                                this.active = Some(action);
+                                this.status = Some(format!("Starting {}…", action.label()));
+                                cx.spawn(async move |this, cx| {
+                                    let result = cx
+                                        .background_executor()
+                                        .spawn(async move { crate::ipc::send_dumper(action) })
+                                        .await;
+                                    if let Err(error) = result {
+                                        let _ = this.update(cx, |this, cx| {
+                                            if this.active == Some(action) {
+                                                this.active = None;
+                                                this.status = Some(format!(
+                                                    "{} could not start: {error:#}",
+                                                    action.label()
+                                                ));
+                                                cx.notify();
+                                            }
+                                        });
+                                    }
+                                })
+                                .detach();
+                                cx.notify();
                             })),
                     ),
             )

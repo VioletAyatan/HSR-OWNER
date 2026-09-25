@@ -1,11 +1,11 @@
-use std::{collections::HashMap, path::PathBuf};
-
+use super::{checkpoint, invoke_error, operation};
+use anyhow::{Context, Result, ensure};
 use il2cpp::{
     get_native_method,
     vm::{boxed_value::BoxedBool, object::Il2CppObject, string::Il2CppString, value::Void},
 };
-use indicatif::{ProgressBar, ProgressStyle};
 use reflection::{method_info::MethodInfo, serializer::BoxedSerializer};
+use std::{collections::BTreeMap, path::PathBuf};
 
 mod level_output_floor;
 mod mission;
@@ -14,178 +14,205 @@ mod rogue_npc;
 mod summon_unit;
 mod video_caption;
 
-pub fn dump() {
-    log::debug!("[Config Dumper] Dumping Configs");
-
-    let mut serializer = BoxedSerializer::default();
-
-    for (name, paths) in config_manifest() {
-        match name.as_str() {
-            "AdventureAbilityConfig" => {
-                dump_from_config_list("LoadAdventureAbilityConfigList", paths, &mut serializer);
+pub fn dump() -> Result<()> {
+    let (type_field, path_field) = super::manifest_fields()?;
+    let manifest = config_manifest(&type_field, &path_field)?;
+    let mut serializer = super::new_serializer();
+    for (name, paths) in manifest {
+        let loader = match name.as_str() {
+            "AdventureAbilityConfig" => "LoadAdventureAbilityConfigList",
+            "TurnBasedAbilityConfig" => "LoadTurnBasedAbilityConfigList",
+            "BattleLineupSkillTreePresetConfig" => "LoadSkillTreePointPresetConfig",
+            "GlobalModifierConfig" => "LoadGlobalModifierConfig",
+            "AdventureModifierConfig" => "LoadAdventureModifierLookupTable",
+            "ComplexSkillAIGlobalGroupConfig" => "LoadComplexSkillAIGlobalGroupLookup",
+            "GlobalTaskTemplate" => "LoadGlobalTaskListTemplateConfig",
+            _ => {
+                checkpoint(format!(
+                    "Config: skip unsupported manifest type {name} paths={}",
+                    paths.len()
+                ));
+                continue;
             }
-            "TurnBasedAbilityConfig" => {
-                dump_from_config_list("LoadTurnBasedAbilityConfigList", paths, &mut serializer);
-            }
-            "BattleLineupSkillTreePresetConfig" => {
-                dump_from_config_list("LoadSkillTreePointPresetConfig", paths, &mut serializer);
-            }
-            "GlobalModifierConfig" => {
-                dump_from_config_list("LoadGlobalModifierConfig", paths, &mut serializer);
-            }
-            "AdventureModifierConfig" => {
-                dump_from_config_list("LoadAdventureModifierLookupTable", paths, &mut serializer);
-            }
-            "ComplexSkillAIGlobalGroupConfig" => {
-                dump_from_config_list(
-                    "LoadComplexSkillAIGlobalGroupLookup",
-                    paths,
-                    &mut serializer,
-                );
-            }
-            "GlobalTaskTemplate" => {
-                dump_from_config_list("LoadGlobalTaskListTemplateConfig", paths, &mut serializer);
-            }
-            _ => {}
-        }
+        };
+        dump_from_config_list(loader, paths, &mut serializer)?;
     }
-
-    summon_unit::dump(&mut serializer);
-    level_output_floor::dump(&mut serializer);
-    video_caption::dump(&mut serializer);
-    rogue_npc::dump(&mut serializer);
-    rogue_chest_map::dump(&mut serializer);
-    mission::dump(&mut serializer);
+    operation("Config/SummonUnit", || summon_unit::dump(&mut serializer))?;
+    operation("Config/LevelOutput", || {
+        level_output_floor::dump(&mut serializer)
+    })?;
+    operation("Config/VideoCaption", || {
+        video_caption::dump(&mut serializer)
+    })?;
+    operation("Config/RogueNPC", || rogue_npc::dump(&mut serializer))?;
+    operation("Config/RogueChestMap", || {
+        rogue_chest_map::dump(&mut serializer)
+    })?;
+    operation("Config/Mission", || mission::dump(&mut serializer))?;
+    Ok(())
 }
 
-fn config_manifest() -> HashMap<String, Vec<String>> {
-    get_native_method("RPG.GameCore.GameCoreConfigManager::LoadConfigManifest()")
-        .unwrap()
-        .invoke::<Void>(Il2CppObject::NULL, &[])
-        .unwrap();
+fn config_manifest(type_field: &str, path_field: &str) -> Result<BTreeMap<String, Vec<String>>> {
+    operation("Config: LoadConfigManifest", || {
+        get_native_method("RPG.GameCore.GameCoreConfigManager::LoadConfigManifest()")
+            .context("missing LoadConfigManifest")?
+            .invoke::<Void>(Il2CppObject::NULL, &[])
+            .map_err(invoke_error)?;
+        Ok(())
+    })?;
+    let getter = get_native_method("RPG.GameCore.ConfigManifest::get_ManifestItems()")
+        .context("missing ConfigManifest.get_ManifestItems")?;
+    let info = MethodInfo::from_handle(getter)?;
+    let items = operation("Config: get_ManifestItems", || {
+        getter
+            .invoke::<Il2CppObject>(Il2CppObject::NULL, &[])
+            .map_err(invoke_error)
+    })?;
+    ensure!(
+        items.0 != 0,
+        "ConfigManifest.get_ManifestItems returned null"
+    );
+    let serialized = operation("Config: serialize manifest", || {
+        super::new_serializer().serialize(info.get_return_type()?, items)
+    })?;
+    parse_manifest(serialized, type_field, path_field)
+}
 
-    let get_manifest = MethodInfo::from_handle(
-        get_native_method("RPG.GameCore.ConfigManifest::get_ManifestItems()").unwrap(),
-    )
-    .unwrap();
-
-    let mut serializer = BoxedSerializer::default();
-    let serialized = serializer
-        .serialize(
-            get_manifest.get_return_type().unwrap(),
-            get_manifest
-                .get_il2cpp_method()
-                .invoke(Il2CppObject::NULL, &[])
-                .unwrap(),
+fn parse_manifest(
+    value: serde_json::Value,
+    type_field: &str,
+    path_field: &str,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let items = value
+        .as_array()
+        .context("Config manifest: expected array")?;
+    let mut out = BTreeMap::<String, Vec<String>>::new();
+    for (index, item) in items.iter().enumerate() {
+        let name = item
+            .get(type_field)
+            .and_then(|value| value.as_str())
+            .with_context(|| {
+                format!("Config manifest item {index}: missing/string field {type_field}")
+            })?;
+        let paths: Vec<String> = serde_json::from_value(
+            item.get(path_field)
+                .with_context(|| {
+                    format!("Config manifest item {index}: missing field {path_field}")
+                })?
+                .clone(),
         )
-        .unwrap();
+        .with_context(|| {
+            format!("Config manifest item {index}: expected string array {path_field}")
+        })?;
+        // A manifest may contain several entries of the same type.
+        out.entry(name.to_string()).or_default().extend(paths);
+    }
+    Ok(out)
+}
 
-    let items: Vec<serde_json::Value> = serde_json::from_value(serialized).unwrap();
-    items
-        .into_iter()
-        .map(|item| {
-            let type_name = item
-                .get(&**crate::res::CONFIG_MANIFEST_TYPE_FIELD)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let path_list = item
-                .get(&**crate::res::CONFIG_MANIFEST_PATH_LIST_FIELD)
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            (type_name, path_list)
-        })
-        .collect()
+fn read_excel(name: &str) -> Result<Vec<serde_json::Value>> {
+    let path = PathBuf::from(format!("./DUMP/Resources/ExcelOutput/{name}.json"));
+    operation(format!("read dependency {}", path.display()), || {
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read Excel dependency {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse Excel dependency {} as an array", path.display()))
+    })
 }
 
 fn dump_from_config_list(
     func_name: &str,
     mut paths: Vec<String>,
     serializer: &mut BoxedSerializer,
-) {
-    let config_name = func_name.strip_prefix("Load").unwrap_or(func_name);
-    log::debug!("Dumping {config_name}...");
-
-    paths.retain(|path| is_json_exists(path));
-
-    let pb = ProgressBar::new(paths.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}\n  {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    for path in paths {
-        if let Err(err) = microseh::try_seh(|| dump_config(func_name, &path, serializer, &pb)) {
-            log::debug!("[{func_name}] -> {path} | Error: Failed to dump. Message: {err:?}");
-        }
-        pb.inc(1);
+) -> Result<()> {
+    paths.sort();
+    paths.dedup();
+    checkpoint(format!("Config: {func_name} paths={}", paths.len()));
+    if paths.is_empty() {
+        return Ok(());
     }
-
-    pb.finish_with_message(format!("Done dumping {config_name}"));
-}
-
-fn dump_config(func_name: &str, path: &str, serializer: &mut BoxedSerializer, pb: &ProgressBar) {
-    pb.set_message(format!(
-        "Dumping: {}",
-        if path.len() > 50 {
-            format!("...{}", &path[path.len() - 47..])
-        } else {
-            path.to_string()
-        }
-    ));
-
-    let Some(load_method) = get_native_method(&format!(
+    let loader = get_native_method(&format!(
         "RPG.GameCore.GameCoreConfigLoader::{func_name}(System.String)"
-    )) else {
-        log::debug!("[{func_name}] method is not exist in GameCoreConfigLoader");
-        return;
-    };
-
-    let load_method_info = MethodInfo::from_handle(load_method).unwrap();
-
-    let data = match load_method
-        .invoke::<Il2CppObject>(Il2CppObject::NULL, &[&Il2CppString::from(path)])
-    {
-        Ok(data) => data,
-        Err(err) => {
-            log::debug!("[{func_name}] -> {path} | Error: Failed to load. Message: {err:?}");
-            return;
+    ))
+    .with_context(|| format!("missing GameCoreConfigLoader::{func_name}(System.String)"))?;
+    let return_type = MethodInfo::from_handle(loader)?.get_return_type()?;
+    let exists = get_native_method("RPG.Client.AssetLoader::ExistsDesignData(System.String)")
+        .context("missing AssetLoader::ExistsDesignData(System.String)")?;
+    let mut skipped = 0;
+    for path in paths {
+        let argument = Il2CppString::from(path.as_str());
+        let present = operation(format!("Config: exists {path}"), || {
+            exists
+                .invoke::<BoxedBool>(Il2CppObject::NULL, &[&argument])
+                .map(|value| value.unbox())
+                .map_err(invoke_error)
+        })?;
+        if !present {
+            skipped += 1;
+            checkpoint(format!("Config: skip absent path {path}"));
+            continue;
         }
-    };
-
-    let serialized = match serializer.serialize(load_method_info.get_return_type().unwrap(), data) {
-        Ok(serialized) => serialized,
-        Err(err) => {
-            log::debug!("{func_name} -> {path} | Error: Failed to serialize. Message: {err:?}");
-            return;
-        }
-    };
-
-    let output_path = PathBuf::from(format!("./DUMP/Resources/{path}"));
-    if let Some(parent) = output_path.parent()
-        && !parent.is_dir()
-    {
-        std::fs::create_dir_all(parent).unwrap();
+        // Propagate existing SEH protection as a task failure, never a false success.
+        microseh::try_seh(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                let data = operation(format!("Config: load {func_name} path={path}"), || {
+                    loader
+                        .invoke::<Il2CppObject>(Il2CppObject::NULL, &[&argument])
+                        .map_err(invoke_error)
+                })?;
+                ensure!(data.0 != 0, "{func_name} path={path}: loader returned null");
+                let serialized =
+                    operation(format!("Config: serialize {func_name} path={path}"), || {
+                        serializer.serialize(return_type, data)
+                    })?;
+                super::write_json(
+                    &PathBuf::from(format!("./DUMP/Resources/{path}")),
+                    &serialized,
+                )
+            }))
+        })
+        .map_err(|error| {
+            anyhow::anyhow!("Config {func_name} path={path}: native exception {error:?}")
+        })?
+        .map_err(|payload| {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic payload");
+            anyhow::anyhow!("Config {func_name} path={path}: Rust panic: {message}")
+        })??;
     }
-
-    std::fs::write(
-        output_path,
-        serde_json::to_string_pretty(&serialized).unwrap(),
-    )
-    .unwrap();
+    checkpoint(format!(
+        "Config: completed {func_name} skipped_absent={skipped}"
+    ));
+    Ok(())
 }
 
-fn is_json_exists(path: &str) -> bool {
-    get_native_method("RPG.Client.AssetLoader::ExistsDesignData(System.String)")
-        .and_then(|m| {
-            m.invoke::<BoxedBool>(Il2CppObject::NULL, &[&Il2CppString::from(path)])
-                .ok()
-        })
-        .is_some_and(|b| b.unbox())
+#[cfg(test)]
+mod tests {
+    use super::parse_manifest;
+    use serde_json::json;
+
+    #[test]
+    fn manifest_merges_repeated_types() {
+        let parsed = parse_manifest(
+            json!([
+                {"type": "A", "paths": ["one"]},
+                {"type": "A", "paths": ["two"]}
+            ]),
+            "type",
+            "paths",
+        )
+        .unwrap();
+        assert_eq!(parsed["A"], ["one", "two"]);
+    }
+
+    #[test]
+    fn manifest_reports_incompatible_fields() {
+        let error =
+            parse_manifest(json!([{"type": "A", "paths": 42}]), "type", "paths").unwrap_err();
+        assert!(format!("{error:#}").contains("item 0"));
+        assert!(format!("{error:#}").contains("paths"));
+    }
 }

@@ -18,6 +18,9 @@ use hsr_ipc::{
 
 pub(crate) mod actions;
 pub(crate) mod frontend;
+mod task_gate;
+
+static DUMPER_GATE: task_gate::TaskGate = task_gate::TaskGate::new();
 
 const CUSTOM_PACKET_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_QUEUE_CAPACITY: usize = 16384;
@@ -75,6 +78,17 @@ pub fn flush_keybind_triggers() {
 }
 
 impl Responder {
+    fn reply_dumper(&self, event: BackendEvent) {
+        // Do not drop Started/Finished/Failed just because progress logs filled the queue.
+        if self
+            .out
+            .send(ServerFrame::Reply { id: self.id, event })
+            .is_err()
+        {
+            log::warn!("[Tunnel] dumper reply {}: client disconnected", self.id);
+        }
+    }
+
     fn reply(&self, event: BackendEvent) {
         let _ = self.out.try_send(ServerFrame::Reply { id: self.id, event });
     }
@@ -147,6 +161,12 @@ fn handle_connection(stream: TcpStream) {
             return;
         }
     };
+    // A client that stops reading must not hold the Dumper gate forever while
+    // a reliable terminal event waits for space in its output queue.
+    if let Err(error) = write_half.set_write_timeout(Some(Duration::from_secs(10))) {
+        log::warn!("[Tunnel] cannot configure client write timeout: {error}");
+        return;
+    }
 
     let (out_tx, out_rx) = mpsc::sync_channel::<ServerFrame>(CLIENT_QUEUE_CAPACITY);
     let client_id = register_client(out_tx.clone());
@@ -157,6 +177,7 @@ fn handle_connection(stream: TcpStream) {
         let mut socket = write_half;
         while let Ok(frame) = out_rx.recv() {
             if hsr_ipc::write_json_frame(&mut socket, &frame).is_err() {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
                 break;
             }
         }
@@ -241,21 +262,41 @@ fn handle_command(responder: &Responder, command: FrontendCommand) {
 }
 
 fn handle_dumper(responder: &Responder, action: DumperAction) {
+    run_dumper(responder, action, &DUMPER_GATE, || actions::run(action));
+}
+
+fn run_dumper(
+    responder: &Responder,
+    action: DumperAction,
+    gate: &task_gate::TaskGate,
+    run: impl FnOnce() -> anyhow::Result<()>,
+) {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    let Some(_guard) = gate.try_enter() else {
+        log::warn!(
+            "[Tunnel] reject dumper {}: another dump is still running",
+            action.label()
+        );
+        responder.reply_dumper(BackendEvent::DumperFailed {
+            action,
+            error: "Another dump is still running; wait for its terminal event and check Console / hsr-owner.log".into(),
+        });
+        return;
+    };
     log::debug!("[Tunnel] run dumper: {action:?}");
     let start = Instant::now();
-    responder.reply(BackendEvent::DumperStarted { action });
+    responder.reply_dumper(BackendEvent::DumperStarted { action });
 
-    match catch_unwind(AssertUnwindSafe(|| actions::run(action))) {
+    match catch_unwind(AssertUnwindSafe(run)) {
         Ok(Ok(())) => {
             let seconds = start.elapsed().as_secs();
             log::debug!("[Tunnel] dumper finished: {} ({seconds}s)", action.label());
-            responder.reply(BackendEvent::DumperFinished { action, seconds });
+            responder.reply_dumper(BackendEvent::DumperFinished { action, seconds });
         }
         Ok(Err(error)) => {
             log::debug!("[Tunnel] dumper failed: {}: {error:#}", action.label());
-            responder.reply(BackendEvent::DumperFailed {
+            responder.reply_dumper(BackendEvent::DumperFailed {
                 action,
                 error: format!("{error:#}"),
             });
@@ -269,7 +310,7 @@ fn handle_dumper(responder: &Responder, action: DumperAction) {
                 "unknown panic payload".to_string()
             };
             log::error!("[Tunnel] dumper panicked: {}: {message}", action.label());
-            responder.reply(BackendEvent::DumperFailed {
+            responder.reply_dumper(BackendEvent::DumperFailed {
                 action,
                 error: format!("internal dumper panic: {message}"),
             });
@@ -458,5 +499,91 @@ fn handle_config(responder: &Responder, command: ConfigCommand) {
         ConfigCommand::SetDumperEnabled { enabled } => {
             responder.reply(BackendEvent::DumperStatus { enabled });
         }
+    }
+}
+
+#[cfg(test)]
+mod dumper_tests {
+    use super::*;
+
+    fn response(rx: &Receiver<ServerFrame>) -> BackendEvent {
+        match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            ServerFrame::Reply { id: 7, event } => event,
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dumper_panic_and_error_send_failed_and_release_gate() {
+        let gate = task_gate::TaskGate::new();
+        let (out, rx) = mpsc::sync_channel(8);
+        let responder = Responder { id: 7, out };
+        run_dumper(&responder, DumperAction::Resources, &gate, || {
+            panic!("broken field")
+        });
+        assert!(matches!(response(&rx), BackendEvent::DumperStarted { .. }));
+        assert!(
+            matches!(response(&rx), BackendEvent::DumperFailed { error, .. } if error.contains("broken field"))
+        );
+        assert!(gate.try_enter().is_some());
+
+        run_dumper(&responder, DumperAction::Resources, &gate, || {
+            anyhow::bail!("missing table")
+        });
+        assert!(matches!(response(&rx), BackendEvent::DumperStarted { .. }));
+        assert!(
+            matches!(response(&rx), BackendEvent::DumperFailed { error, .. } if error.contains("missing table"))
+        );
+        assert!(gate.try_enter().is_some());
+    }
+
+    #[test]
+    fn busy_dumper_does_not_run_or_emit_started() {
+        let gate = task_gate::TaskGate::new();
+        let _guard = gate.try_enter().unwrap();
+        let (out, rx) = mpsc::sync_channel(8);
+        let responder = Responder { id: 7, out };
+        run_dumper(&responder, DumperAction::Resources, &gate, || {
+            panic!("must not run")
+        });
+        assert!(
+            matches!(response(&rx), BackendEvent::DumperFailed { error, .. } if error.contains("still running"))
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn all_dumper_actions_preserve_started_finished_events() {
+        for action in DumperAction::ALL {
+            let gate = task_gate::TaskGate::new();
+            let (out, rx) = mpsc::sync_channel(8);
+            let responder = Responder { id: 7, out };
+            run_dumper(&responder, action, &gate, || Ok(()));
+            assert!(
+                matches!(response(&rx), BackendEvent::DumperStarted { action: a } if a == action)
+            );
+            assert!(
+                matches!(response(&rx), BackendEvent::DumperFinished { action: a, .. } if a == action)
+            );
+            assert!(gate.try_enter().is_some());
+        }
+    }
+
+    #[test]
+    fn terminal_reply_waits_for_queue_space_instead_of_dropping() {
+        let (out, rx) = mpsc::sync_channel(1);
+        let responder = Responder { id: 7, out };
+        responder.reply(BackendEvent::DumperStarted {
+            action: DumperAction::Resources,
+        });
+        let worker = thread::spawn(move || {
+            responder.reply_dumper(BackendEvent::DumperFinished {
+                action: DumperAction::Resources,
+                seconds: 0,
+            })
+        });
+        assert!(matches!(response(&rx), BackendEvent::DumperStarted { .. }));
+        assert!(matches!(response(&rx), BackendEvent::DumperFinished { .. }));
+        worker.join().unwrap();
     }
 }

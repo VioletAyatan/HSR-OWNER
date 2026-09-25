@@ -1,7 +1,7 @@
 mod boxed_serializer;
 mod newtonsoft_serializer;
 
-use std::{sync::OnceLock, time::Duration};
+use std::sync::OnceLock;
 
 use il2cpp::{
     CLASS_TABLE_VEC, get_cached_class,
@@ -30,18 +30,14 @@ pub fn postfix_expr_type() -> RuntimeType {
             .iter()
             .position(|&v| v == op_code_class)
         else {
-            log::debug!("[Boxed Serializer] failed to get RPG.Expression.OpCode");
-            std::thread::sleep(Duration::from_secs(u64::MAX));
-            return RuntimeType(0);
+            panic!("[Boxed Serializer] RPG.Expression.OpCode missing from class table; cannot resolve PostfixExpr");
         };
 
         let postfix_expr_class =
             metadata_cache::get_typeinfo_from_typedefindex((op_code_class_idx + 2) as u32);
 
         if postfix_expr_class.get_fields().len() != 3 {
-            log::debug!("[Boxed Serializer] PostfixExpr class ordering is changed!");
-            std::thread::sleep(Duration::from_secs(u64::MAX));
-            return RuntimeType(0);
+            panic!("[Boxed Serializer] PostfixExpr class ordering changed; expected 3 fields");
         }
 
         log::debug!(
@@ -64,11 +60,7 @@ pub fn dynamic_values_type() -> RuntimeType {
             .unwrap();
 
         if dynamic_values_prop.is_null() {
-            log::debug!(
-                "[Boxed Serializer] cannot find DynamicValues property! might be obfuscated now"
-            );
-            std::thread::sleep(Duration::from_secs(u64::MAX));
-            return RuntimeType(0);
+            panic!("[Boxed Serializer] BaseModifierInstance.DynamicValues property missing; game version may be incompatible");
         }
 
         let property_type = dynamic_values_prop.get_property_type().unwrap();

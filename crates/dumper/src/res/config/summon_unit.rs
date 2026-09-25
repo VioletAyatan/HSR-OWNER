@@ -1,17 +1,21 @@
+use anyhow::{Context, Result};
 use reflection::serializer::BoxedSerializer;
-use serde_json::{Map, Value};
-use std::fs;
+use serde_json::Value;
 
-pub fn dump(serializer: &mut BoxedSerializer) {
-    let summon_unit_data: Vec<Map<String, Value>> = serde_json::from_slice(
-        &fs::read("./DUMP/Resources/ExcelOutput/SummonUnitData.json").unwrap(),
-    )
-    .unwrap();
+pub fn dump(serializer: &mut BoxedSerializer) -> Result<()> {
+    let summon_unit_data = super::read_excel("SummonUnitData")?;
 
-    let paths: Vec<_> = summon_unit_data
+    let paths: Result<Vec<_>> = summon_unit_data
         .iter()
-        .map(|data| data.get("JsonPath").unwrap().as_str().unwrap().to_string())
+        .enumerate()
+        .map(|(index, data)| {
+            data.get("JsonPath")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .with_context(|| format!("SummonUnitData row {index} has invalid JsonPath"))
+        })
         .collect();
 
-    super::dump_from_config_list("LoadSummonUnitConfig", paths, serializer);
+    super::dump_from_config_list("LoadSummonUnitConfig", paths?, serializer)?;
+    Ok(())
 }

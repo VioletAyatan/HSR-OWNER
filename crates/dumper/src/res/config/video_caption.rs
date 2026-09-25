@@ -1,26 +1,26 @@
+use anyhow::{Context, Result};
 use reflection::serializer::BoxedSerializer;
 use serde_json::Value;
 
-#[inline]
-fn extract_caption_paths(path: &'static str) -> std::io::Result<Vec<String>> {
-    let data = std::fs::read(path)?;
-    let json: Vec<Value> = serde_json::from_slice(&data)?;
-    Ok(json
-        .into_iter()
-        .filter_map(|item| item.get("CaptionPath")?.as_str().map(std::string::ToString::to_string))
-        .collect())
+fn extract_caption_paths(name: &str) -> Result<Vec<String>> {
+    let json = super::read_excel(name)?;
+    json.iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.get("CaptionPath")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .with_context(|| format!("{name} row {index} has invalid CaptionPath"))
+        })
+        .collect()
 }
 
-pub fn dump(serializer: &mut BoxedSerializer) {
-    let paths = [
-        "./DUMP/Resources/ExcelOutput/VideoConfig.json",
-        "./DUMP/Resources/ExcelOutput/CutSceneConfig.json",
-        "./DUMP/Resources/ExcelOutput/LoopCGConfig.json",
-    ]
-    .into_iter()
-    .filter_map(|path| extract_caption_paths(path).ok())
-    .flatten()
-    .collect::<Vec<_>>();
+pub fn dump(serializer: &mut BoxedSerializer) -> Result<()> {
+    let mut paths = Vec::new();
+    for name in ["VideoConfig", "CutSceneConfig", "LoopCGConfig"] {
+        paths.extend(extract_caption_paths(name).with_context(|| format!("reading {name}"))?);
+    }
 
-    super::dump_from_config_list("LoadVideoCaptionConfig", paths, serializer);
+    super::dump_from_config_list("LoadVideoCaptionConfig", paths, serializer)?;
+    Ok(())
 }
