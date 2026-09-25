@@ -1,3 +1,7 @@
+use super::asm_address::{
+    direct_branch_rva, direct_branch_target, global_memory_rva, module_rva, previous_type_load,
+};
+use crate::dump_progress::Progress;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
@@ -12,9 +16,7 @@ use crate::{
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use il2cpp::vm::method::Il2CppMethod;
 use il2cpp::{
-    FUNCTIONS_TABLE_REFLECTION, GA_BASE,
-    api::Il2CppClass,
-    get_cached_class, get_native_method,
+    FUNCTIONS_TABLE_REFLECTION, GA_BASE, get_cached_class, get_native_method,
     vm::{
         metadata_cache, native_collections::Dictionary, object::Il2CppObject, r#type::Il2CppType,
     },
@@ -236,14 +238,16 @@ fn disasm_obf_deobf_method_by_xlua_obj_translator() -> HashMap<String, String> {
         let il2cpp_object_new_rva = *IL2CPP_OBJECT_NEW_RVA;
         if let Some(offset) = static_field_offset
             && instruction.mnemonic() == Mnemonic::Call
-            && instruction.near_branch_target() == (*il2cpp::GA_BASE + il2cpp_object_new_rva) as u64
+            && direct_branch_rva(&instruction, *GA_BASE, slice.len()) == Some(il2cpp_object_new_rva)
         {
             decoder.decode_out(&mut instruction); // skip mov rsi, rax
             decoder.decode_out(&mut instruction);
 
             // mov rax, cs::METHOD_INFO_VA
-            if instruction.mnemonic() == Mnemonic::Mov && instruction.op1_kind() == OpKind::Memory {
-                let type_va = instruction.memory_displacement64() as usize;
+            if instruction.mnemonic() == Mnemonic::Mov
+                && let Some(rva) = global_memory_rva(&instruction, 1, *GA_BASE, slice.len())
+            {
+                let type_va = *GA_BASE + rva;
 
                 let method = unsafe { *(type_va as *const Il2CppMethod) };
                 if method.0 == 0 {
@@ -275,18 +279,25 @@ pub fn get_req_map(
     minimal_info: &HashMap<RuntimeType, MessageMinimalInfo>,
     rsp_notify_map: &HashMap<RuntimeType, u16>,
     req_map: &mut HashMap<RuntimeType, (u16, Option<String>)>,
+    progress: &Progress,
 ) -> HashMap<RuntimeType, Vec<String>> {
     let Some(type_infos) = TYPE_INFOS.get() else {
         log::debug!("[Proto Dumper] TYPE_INFOS unavailable; skipping request mapping");
         return HashMap::new();
     };
 
+    progress.step(0, 0, "resolve request TypeInfo slots");
     let type_info_rvas = minimal_info
         .iter()
         .filter(|(ty, _)| !ty.get_isenum().unwrap().unbox() && !rsp_notify_map.contains_key(ty))
-        .filter_map(|(ty, _)| type_infos.get(&ty.get_il2cpp_type().get_class()).copied())
-        .collect::<HashSet<_>>();
+        .filter_map(|(ty, _)| {
+            type_infos
+                .get(&ty.get_il2cpp_type().get_class())
+                .map(|&rva| (rva, *ty))
+        })
+        .collect::<HashMap<_, _>>();
 
+    progress.step(0, 0, "resolve request send targets");
     let networkmanager_send_name = &*NETWORK_MANAGER_SEND_NAME;
     let networkmanager_send_va = if networkmanager_send_name.is_empty() {
         0
@@ -322,7 +333,7 @@ pub fn get_req_map(
         targets.len()
     );
 
-    disasm_all_req(&type_info_rvas, targets, rsp_notify_map, req_map)
+    disasm_all_req(&type_info_rvas, targets, rsp_notify_map, req_map, progress)
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -332,14 +343,23 @@ enum ReqFlavor {
 }
 
 fn disasm_all_req(
-    type_info_rvas: &HashSet<usize>,
+    type_info_rvas: &HashMap<usize, RuntimeType>,
     targets: HashMap<usize, ReqFlavor>,
     rsp_notify_map: &HashMap<RuntimeType, u16>,
     out: &mut HashMap<RuntimeType, (u16, Option<String>)>,
+    progress: &Progress,
 ) -> HashMap<RuntimeType, Vec<String>> {
+    progress.step(0, 0, "resolve XLua request names");
     let va_deobf_map = get_req_method_va_name_map();
     let slice = game_assembly_slice();
-    let mut decoder = Decoder::with_ip(64, slice, *GA_BASE as u64, DecoderOptions::NONE);
+    let base = *GA_BASE;
+    progress.step(0, 0, "resolve object allocator");
+    let object_new_rva = *IL2CPP_OBJECT_NEW_RVA;
+    let mut decoder = Decoder::with_ip(64, slice, base as u64, DecoderOptions::NONE);
+    progress.stage("request call-site scan", slice.len());
+    let mut decoded = 0usize;
+    let mut send_calls = 0usize;
+    let mut indirect_branches = 0usize;
 
     let mut instruction = Instruction::default();
     let mut instructions = VecDeque::<Instruction>::with_capacity(500);
@@ -382,6 +402,14 @@ fn disasm_all_req(
 
     while decoder.can_decode() {
         decoder.decode_out(&mut instruction);
+        if decoded % 4096 == 0 {
+            progress.step(
+                decoder.position(),
+                instruction.ip() as usize,
+                "decode request instructions",
+            );
+        }
+        decoded += 1;
 
         if instruction.mnemonic() == Mnemonic::Push
             && let Some(prev) = instructions.back()
@@ -391,9 +419,15 @@ fn disasm_all_req(
             instructions.clear();
         }
 
-        if (instruction.mnemonic() == Mnemonic::Jmp || instruction.mnemonic() == Mnemonic::Call)
-            && let Some(&flavor) = targets.get(&(instruction.near_branch_target() as usize))
+        if let Some(target) = direct_branch_target(&instruction)
+            && let Some(&flavor) = targets.get(&target)
         {
+            send_calls += 1;
+            progress.step(
+                decoder.position(),
+                instruction.ip() as usize,
+                "trace request arguments",
+            );
             let mut obj_register = None;
             let mut cmd_id = None;
             let mut push_rva = None;
@@ -409,7 +443,7 @@ fn disasm_all_req(
                 }
             }
             if let Some(push_index) = last_push_index {
-                push_rva = Some(instructions[push_index].ip() as usize - *GA_BASE);
+                push_rva = module_rva(instructions[push_index].ip() as usize, base, slice.len());
             }
 
             for i in (0..instructions.len()).rev() {
@@ -419,14 +453,23 @@ fn disasm_all_req(
                 }
 
                 // 1: CmdId
-                if cmd_id.is_none() && inst.mnemonic() == Mnemonic::Mov {
+                if cmd_id.is_none()
+                    && inst.mnemonic() == Mnemonic::Mov
+                    && matches!(
+                        inst.op1_kind(),
+                        OpKind::Immediate16
+                            | OpKind::Immediate32
+                            | OpKind::Immediate32to64
+                            | OpKind::Immediate64
+                    )
+                {
                     let reg = inst.op0_register();
                     let is_match = match flavor {
                         ReqFlavor::Standard => reg == Register::DX,
                         ReqFlavor::Fight => reg == Register::R8 || reg == Register::R8W,
                     };
                     if is_match {
-                        let id = inst.immediate16();
+                        let id = inst.immediate(1) as u16;
                         if id != 0 && !rsp_notify_map.values().any(|&v| v == id) {
                             cmd_id = Some(id);
                         }
@@ -485,26 +528,30 @@ fn disasm_all_req(
                     if reg.is_rax()
                         && (inst.mnemonic() == Mnemonic::Call || inst.mnemonic() == Mnemonic::Jmp)
                     {
-                        let target_va = inst.near_branch_target() as usize;
-                        if target_va - *GA_BASE == *IL2CPP_OBJECT_NEW_RVA {
-                            let va = instructions[i - 1].memory_displacement64() as usize;
-                            if type_info_rvas.contains(&(va - *GA_BASE)) {
-                                let class = unsafe { *(va as *const Il2CppClass) };
-                                if let Ok(rt) = RuntimeType::from_class(class) {
-                                    let deobf_name = cur_func_va
-                                        .and_then(|v| va_deobf_map.get(&(v as usize)).cloned());
-                                    let entry = candidates.entry(rt).or_insert_with(|| {
-                                        (HashSet::new(), HashSet::new(), Vec::new())
-                                    });
-                                    entry.0.insert(cmd_id);
-                                    entry.1.insert(deobf_name);
-                                    if let Some(prva) = push_rva {
-                                        entry.2.push(format!("0x{prva:X}"));
-                                    }
-                                    break;
-                                }
-                            }
+                        if direct_branch_target(&inst).is_none() {
+                            indirect_branches += 1;
                         }
+                        if object_new_rva != 0
+                            && direct_branch_rva(&inst, base, slice.len()) == Some(object_new_rva)
+                            && let Some(rva) =
+                                previous_type_load(&instructions, i, base, slice.len())
+                            && let Some(&rt) = type_info_rvas.get(&rva)
+                        {
+                            let deobf_name =
+                                cur_func_va.and_then(|v| va_deobf_map.get(&(v as usize)).cloned());
+                            let entry = candidates
+                                .entry(rt)
+                                .or_insert_with(|| (HashSet::new(), HashSet::new(), Vec::new()));
+                            entry.0.insert(cmd_id);
+                            entry.1.insert(deobf_name);
+                            if let Some(prva) = push_rva {
+                                entry.2.push(format!("0x{prva:X}"));
+                            }
+                            break;
+                        }
+                        // RAX is this call's result. An unknown call cannot be
+                        // traced through to an earlier allocation of another object.
+                        break;
                     }
 
                     // B: Cmp
@@ -523,25 +570,21 @@ fn disasm_all_req(
                                 let prev = instructions[j];
                                 if prev.mnemonic() == Mnemonic::Mov
                                     && prev.op0_register() == type_info_reg
+                                    && let Some(rva) =
+                                        global_memory_rva(&prev, 1, base, slice.len())
+                                    && let Some(&rt) = type_info_rvas.get(&rva)
                                 {
-                                    let va = prev.memory_displacement64() as usize;
-                                    if type_info_rvas.contains(&(va - *GA_BASE)) {
-                                        let class = unsafe { *(va as *const Il2CppClass) };
-                                        if let Ok(rt) = RuntimeType::from_class(class) {
-                                            let deobf_name = cur_func_va.and_then(|v| {
-                                                va_deobf_map.get(&(v as usize)).cloned()
-                                            });
-                                            let entry = candidates.entry(rt).or_insert_with(|| {
-                                                (HashSet::new(), HashSet::new(), Vec::new())
-                                            });
-                                            entry.0.insert(cmd_id);
-                                            entry.1.insert(deobf_name);
-                                            if let Some(prva) = push_rva {
-                                                entry.2.push(format!("0x{prva:X}"));
-                                            }
-                                            break;
-                                        }
+                                    let deobf_name = cur_func_va
+                                        .and_then(|v| va_deobf_map.get(&(v as usize)).cloned());
+                                    let entry = candidates.entry(rt).or_insert_with(|| {
+                                        (HashSet::new(), HashSet::new(), Vec::new())
+                                    });
+                                    entry.0.insert(cmd_id);
+                                    entry.1.insert(deobf_name);
+                                    if let Some(prva) = push_rva {
+                                        entry.2.push(format!("0x{prva:X}"));
                                     }
+                                    break;
                                 }
                             }
                             if candidates.values().any(|v| v.0.contains(&cmd_id)) {
@@ -558,6 +601,8 @@ fn disasm_all_req(
         instructions.push_back(instruction);
     }
 
+    let candidate_count = candidates.len();
+    let mut ambiguous = 0;
     for (rt, (ids, names, rvas)) in candidates {
         if ids.len() == 1 {
             out.insert(
@@ -568,139 +613,119 @@ fn disasm_all_req(
                 ),
             );
             req_rvas.insert(rt, rvas);
+        } else {
+            ambiguous += 1;
         }
     }
+    log::info!(
+        "[Proto Dumper] request scan completed instructions={decoded} send_calls={send_calls} indirect_branches_without_static_target={indirect_branches} candidate_types={candidate_count} mapped={} ambiguous_cmd_ids={ambiguous}",
+        req_rvas.len()
+    );
     req_rvas
 }
 
-pub fn get_rsp_notify_names() -> HashMap<String, String> {
-    let cached_methods = FUNCTIONS_TABLE_REFLECTION.get().unwrap();
-    let prefixes_to_replace = ["_OnCmd", "_Cmd", "_On", "OnCmd", "On", "Cmd"];
-
-    let mut nt_map = HashMap::new();
-
-    for (m_name, m) in cached_methods {
-        if !m_name.ends_with("(System.UInt16,System.Object)") {
-            continue;
-        }
-
-        let Some(proto_class) = disasm_rsp_notify_3_args(m.rva()) else {
-            continue;
-        };
-
-        let m_name = m.get_name();
-        for prefix in prefixes_to_replace {
-            if let Some(name) = m_name.strip_prefix(prefix) {
-                let _ = microseh::try_seh(|| {
-                    nt_map.insert(
-                        RuntimeType::from_class(proto_class)
-                            .unwrap()
-                            .format_type_name(true),
-                        name.to_string()
-                            .replace("Cmd", "")
-                            .replace("ScRep", "ScRsp"),
-                    );
-                });
-            }
-        }
-    }
-
-    nt_map
+pub(super) struct ResponseMappings {
+    pub names: HashMap<String, String>,
+    pub method_rvas: HashMap<String, Vec<String>>,
 }
 
-pub fn get_rsp_notify_method_rvas() -> HashMap<String, Vec<String>> {
-    let cached_methods = FUNCTIONS_TABLE_REFLECTION.get().unwrap();
-    let prefixes_to_replace = ["_OnCmd", "_Cmd", "_On", "OnCmd", "On", "Cmd"];
-
-    let mut rva_map: HashMap<String, Vec<String>> = HashMap::new();
-
-    for (m_name, m) in cached_methods {
-        if !m_name.ends_with("(System.UInt16,System.Object)") {
-            continue;
-        }
-
-        let Some(proto_class) = disasm_rsp_notify_3_args(m.rva()) else {
-            continue;
-        };
-
-        let m_name_str = m.get_name();
-        for prefix in prefixes_to_replace {
-            if m_name_str.starts_with(prefix) {
-                let _ = microseh::try_seh(|| {
-                    let formatted_name = RuntimeType::from_class(proto_class)
-                        .unwrap()
-                        .format_type_name(true)
-                        .replace("ScRep", "ScRsp");
-
-                    rva_map
-                        .entry(formatted_name)
-                        .or_default()
-                        .push(format!("0x{:X}", m.rva()));
-                });
-                break;
-            }
+pub(super) fn collect_rsp_notify_mappings(
+    minimal_info: &HashMap<RuntimeType, MessageMinimalInfo>,
+    progress: &Progress,
+) -> anyhow::Result<ResponseMappings> {
+    use anyhow::Context;
+    let cached_methods = FUNCTIONS_TABLE_REFLECTION
+        .get()
+        .context("reflection methods unavailable")?;
+    let type_infos = TYPE_INFOS
+        .get()
+        .context("Script TypeInfo cache unavailable")?;
+    let mut types = HashMap::new();
+    progress.step(0, 0, "resolve response TypeInfo slots");
+    for &ty in minimal_info.keys() {
+        if let Some(&slot) = type_infos.get(&ty.get_il2cpp_type().get_class()) {
+            types.insert(slot, ty);
         }
     }
-
-    rva_map
-}
-
-fn disasm_rsp_notify_3_args(rva: usize) -> Option<Il2CppClass> {
-    let slice = game_assembly_slice();
-    let mut decoder = Decoder::with_ip(
-        64,
-        &slice[rva..],
-        (*GA_BASE + rva) as u64,
-        DecoderOptions::NONE,
+    let slots = types.keys().copied().collect::<HashSet<_>>();
+    let handlers = cached_methods
+        .iter()
+        .filter_map(|(signature, method)| {
+            let name = signature
+                .strip_suffix("(System.UInt16,System.Object)")?
+                .rsplit_once("::")?
+                .1;
+            let prefix = ["_OnCmd", "_Cmd", "_On", "OnCmd", "On", "Cmd"]
+                .into_iter()
+                .find(|prefix| name.starts_with(prefix))?;
+            Some((
+                signature,
+                method,
+                name.strip_prefix(prefix)
+                    .unwrap()
+                    .replace("Cmd", "")
+                    .replace("ScRep", "ScRsp"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let image = game_assembly_slice();
+    let base = *GA_BASE;
+    let functions = super::rsp_scan::FunctionTable::from_pe(image)
+        .context("response handler function bounds")?;
+    progress.stage("response/notify names", handlers.len());
+    let mut output = ResponseMappings {
+        names: HashMap::new(),
+        method_rvas: HashMap::new(),
+    };
+    let mut formatted = HashMap::<RuntimeType, String>::new();
+    let mut no_body = 0;
+    let mut unmatched = 0;
+    let mut decoded = 0;
+    let mut matched = 0;
+    for (index, (signature, method, name)) in handlers.into_iter().enumerate() {
+        progress.step(index, method.0, "resolve response handler address");
+        let va = method.va();
+        let Some(rva) = module_rva(va, base, image.len()).filter(|&rva| rva != 0) else {
+            no_body += 1;
+            continue;
+        };
+        let Some(range) = functions.containing(rva) else {
+            no_body += 1;
+            continue;
+        };
+        progress.step(index, va, "decode response handler");
+        let result = super::rsp_scan::scan(&image[range], va as u64, base, image.len(), &slots);
+        decoded += result.decoded;
+        let Some(slot) = result.slot else {
+            unmatched += 1;
+            continue;
+        };
+        // The scanner can return only a declared slot; no guessed native pointer.
+        let ty = types[&slot];
+        progress.step(index, ty.0, "format response type name");
+        let formatted_name = if let Some(name) = formatted.get(&ty) {
+            name.clone()
+        } else {
+            let value = ty.format_type_name(true);
+            formatted.insert(ty, value.clone());
+            value
+        };
+        output.names.insert(formatted_name.clone(), name.clone());
+        output
+            .method_rvas
+            .entry(formatted_name.replace("ScRep", "ScRsp"))
+            .or_default()
+            .push(format!("0x{rva:X}"));
+        matched += 1;
+        log::debug!(
+            "[Proto Dumper] response handler mapped index={index} rva=0x{rva:X} type_slot=0x{slot:X} method={signature} name={name}"
+        );
+    }
+    log::info!(
+        "[Proto Dumper] response scan completed matched_handlers={matched} named_types={} instructions={decoded} no_function_body={no_body} unmatched={unmatched}",
+        output.names.len()
     );
-
-    let mut instruction = Instruction::default();
-
-    let mut is_passing_push = false;
-    let mut current_r8_reg = Register::R8;
-    let mut current_dereferenced_reg = None;
-
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instruction);
-
-        // Move current r8 reg into another reg
-        // mov new_current_r8_reg, current_r8_reg
-        if instruction.mnemonic() == Mnemonic::Mov && instruction.op1_register() == current_r8_reg {
-            current_r8_reg = instruction.op0_register();
-            is_passing_push = true;
-        }
-
-        // detect if current_r8_reg is being dereferenced
-        // mov current_dereferenced_reg, [current_r8_reg]
-        if instruction.op1_kind() == OpKind::Memory && instruction.memory_base() == current_r8_reg {
-            current_dereferenced_reg = Some(instruction.op0_register());
-        }
-
-        // cmp current_dereferenced_reg, cs:PROTO_TYPE
-        if instruction.mnemonic() == Mnemonic::Cmp
-            && let Some(reg) = current_dereferenced_reg
-            && instruction.op0_register() == reg
-            && instruction.op1_kind() == OpKind::Memory
-        {
-            let va = instruction.memory_displacement64() as usize;
-            match microseh::try_seh(|| {
-                let class = unsafe { *(va as *const Il2CppClass) };
-                if class.0 != 0 { Some(class) } else { None }
-            }) {
-                Ok(data) => return data,
-                Err(_err) => {
-                    return None;
-                }
-            }
-        }
-
-        // already out of current sub_
-        if is_passing_push && instruction.mnemonic() == Mnemonic::Push {
-            break;
-        }
-    }
-
-    None
+    Ok(output)
 }
 
 fn strip_prefixes<'a>(s: &'a str, prefixes: &[&str]) -> &'a str {

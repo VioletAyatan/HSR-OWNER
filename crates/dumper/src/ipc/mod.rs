@@ -515,26 +515,42 @@ mod dumper_tests {
 
     #[test]
     fn dumper_panic_and_error_send_failed_and_release_gate() {
-        let gate = task_gate::TaskGate::new();
-        let (out, rx) = mpsc::sync_channel(8);
-        let responder = Responder { id: 7, out };
-        run_dumper(&responder, DumperAction::Resources, &gate, || {
-            panic!("broken field")
-        });
-        assert!(matches!(response(&rx), BackendEvent::DumperStarted { .. }));
-        assert!(
-            matches!(response(&rx), BackendEvent::DumperFailed { error, .. } if error.contains("broken field"))
+        let mut actions = DumperAction::ALL.to_vec();
+        actions.extend(
+            [
+                hsr_ipc::ProtoDumpMode::ClassFieldNumber,
+                hsr_ipc::ProtoDumpMode::MergeFrom,
+                hsr_ipc::ProtoDumpMode::WriteTo,
+                hsr_ipc::ProtoDumpMode::Asm,
+            ]
+            .map(|mode| DumperAction::Proto { mode }),
         );
-        assert!(gate.try_enter().is_some());
+        for action in actions {
+            let gate = task_gate::TaskGate::new();
+            let (out, rx) = mpsc::sync_channel(8);
+            let responder = Responder { id: 7, out };
+            run_dumper(&responder, action, &gate, || panic!("broken field"));
+            assert!(
+                matches!(response(&rx), BackendEvent::DumperStarted { action: a } if a == action)
+            );
+            assert!(
+                matches!(response(&rx), BackendEvent::DumperFailed { action: a, error } if a == action && error.contains("broken field"))
+            );
+            assert!(gate.try_enter().is_some());
 
-        run_dumper(&responder, DumperAction::Resources, &gate, || {
-            anyhow::bail!("missing table")
-        });
-        assert!(matches!(response(&rx), BackendEvent::DumperStarted { .. }));
-        assert!(
-            matches!(response(&rx), BackendEvent::DumperFailed { error, .. } if error.contains("missing table"))
-        );
-        assert!(gate.try_enter().is_some());
+            run_dumper(&responder, action, &gate, || anyhow::bail!("missing table"));
+            assert!(
+                matches!(response(&rx), BackendEvent::DumperStarted { action: a } if a == action)
+            );
+            assert!(
+                matches!(response(&rx), BackendEvent::DumperFailed { action: a, error } if a == action && error.contains("missing table"))
+            );
+            assert!(gate.try_enter().is_some());
+            assert!(
+                rx.try_recv().is_err(),
+                "failure must not also emit Finished"
+            );
+        }
     }
 
     #[test]

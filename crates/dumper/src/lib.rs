@@ -9,6 +9,7 @@ use windows::{
 
 mod apc_thread;
 mod csharp;
+mod dump_progress;
 mod ipc;
 mod logging;
 mod parser_data;

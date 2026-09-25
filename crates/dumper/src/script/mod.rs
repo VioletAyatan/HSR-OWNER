@@ -1,3 +1,10 @@
+use crate::dump_progress::Progress;
+use anyhow::{Context, Result, ensure};
+use std::io::{BufWriter, Write};
+
+mod init_calls;
+mod memory;
+
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use il2cpp::{
     MAX_TYPEDEFINDEX,
@@ -8,7 +15,11 @@ use il2cpp::{
 };
 use reflection::{method_info::MethodInfo, runtime_type::RuntimeType};
 use serde::{Serialize, Serializer, ser::SerializeStruct as _};
-use std::{borrow::Cow, collections::HashMap, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    collections::{BTreeSet, HashMap},
+    sync::OnceLock,
+};
 use utils::{game_assembly_slice, scan_ga_section};
 
 #[derive(Serialize)]
@@ -79,237 +90,437 @@ impl Serialize for ScriptJson {
     }
 }
 
-//
-const GET_METADATA_FROM_INDEX_FUNC_PTR: usize = 0x0; // atas "yes" di "mscorlib.dll", no args mungkin?
-const TABLE_BASE: usize = 0x0;
-const TYPEINFO_OFFSET: usize = 0x0; // case 1
-const METHODINFO_OFFSET: usize = 0x0; // case 3, 6
-const STRINGLITERAL_OFFSET: usize = 0x0; // case 5
-
 pub static METADATA_METHODS: OnceLock<HashMap<i32, HashMap<i32, Vec<MethodInfo>>>> =
     OnceLock::new();
-pub static TYPE_INFOS: OnceLock<HashMap<Il2CppClass, usize>> = OnceLock::new(); // <Il2CppClass, rva>
-pub static METHODS: OnceLock<HashMap<u64, Il2CppMethod>> = OnceLock::new(); // <rva, Il2CppMethod>
-pub static STRING_LITERALS: OnceLock<HashMap<usize, Il2CppString>> = OnceLock::new(); // <rva, Il2CppString>
+pub static TYPE_INFOS: OnceLock<HashMap<Il2CppClass, usize>> = OnceLock::new();
+pub static METHODS: OnceLock<HashMap<u64, Il2CppMethod>> = OnceLock::new();
+pub static STRING_LITERALS: OnceLock<HashMap<usize, Il2CppString>> = OnceLock::new();
 
-#[allow(unused)]
-pub fn dump() {
-    unsafe {
-        if STRING_LITERALS.get().is_some() {
-            return;
-        }
+pub(crate) fn is_ready() -> bool {
+    METHODS.get().is_some()
+        && TYPE_INFOS.get().is_some()
+        && METADATA_METHODS.get().is_some()
+        && STRING_LITERALS.get().is_some()
+}
 
-        log::debug!("[Script Dumper] dumping script...");
+pub fn dump() -> Result<()> {
+    let progress = Progress::start("Script")?;
+    let result = dump_inner(&progress);
+    progress.finish(&result);
+    result
+}
 
-        let mut out = ScriptJson::default();
+fn dump_inner(progress: &Progress) -> Result<()> {
+    let initialized = [
+        METHODS.get().is_some(),
+        TYPE_INFOS.get().is_some(),
+        METADATA_METHODS.get().is_some(),
+        STRING_LITERALS.get().is_some(),
+    ];
+    if initialized.iter().all(|&ready| ready) {
+        log::info!("[Script Dumper] using completed metadata cache");
+        return Ok(());
+    }
+    ensure!(
+        initialized.iter().all(|&ready| !ready),
+        "incomplete Script cache; restart the game before retrying"
+    );
 
-        let mut methods = HashMap::new();
-        dump_methods(&mut out, &mut methods);
-        METHODS.set(methods);
+    let mut out = ScriptJson::default();
+    let mut methods = HashMap::new();
+    dump_methods(&mut out, &mut methods, progress)?;
 
-        let (metadata_init_rva, table_rva, offsets) = if let Some((metadata_init_rva, table_va, offsets)) = scan_address() {
-            let table_rva = table_va - *il2cpp::GA_BASE;
-            log::debug!(
-                "[Script Dumper] Metadata Init: 0x{metadata_init_rva:X} | Table Base: 0x{table_rva:X} | Offsets: {}",
-                offsets
-                    .iter()
-                    .map(|(case, offset)| match *case {
-                        1 => {
-                            format!("TypeInfo {offset}")
-                        }
-                        3 | 6 => {
-                            format!("MethodInfo {offset}")
-                        }
-                        5 => {
-                            format!("StringLiteral {offset}")
-                        }
-                        other => format!("case {other} => {offset}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ")
+    progress.stage("locate metadata tables", 0);
+    let (metadata_init_rva, table_va, offsets) =
+        guarded(|| scan_address().context("metadata initializer/table signature not found"))
+            .context("locate Script metadata tables")?;
+    let base = *il2cpp::GA_BASE;
+    let image = game_assembly_slice();
+    ensure!(
+        metadata_init_rva < image.len(),
+        "initializer outside GameAssembly"
+    );
+    ensure!(
+        table_va >= base && table_va - base <= image.len().saturating_sub(8),
+        "metadata table root outside GameAssembly"
+    );
+    log::info!(
+        "[Script Dumper] metadata_init_rva=0x{metadata_init_rva:X} table_rva=0x{:X} type_offset={:?} method_offset={:?} string_offset={:?}",
+        table_va - base,
+        offsets.get(&1),
+        offsets.get(&3),
+        offsets.get(&5)
+    );
+
+    progress.stage("scan metadata initialization call sites", image.len());
+    let calls =
+        guarded(|| init_calls::collect(image, base as u64, (base + metadata_init_rva) as u64))?;
+    progress.stage("validate metadata initialization bounds", 0);
+    let metadata = guarded(|| init_calls::validated_metadata(image, base, metadata_init_rva))?;
+    let list_count = metadata.list_count;
+    log::info!(
+        "[Script Dumper] validated usage_pairs={} type_slots={} type_max_index={:?} method_slots={} method_max_index={:?} string_slots={} string_max_index={:?}",
+        metadata.pair_count,
+        metadata.slots.types.len(),
+        metadata.slots.types.last(),
+        metadata.slots.methods.len(),
+        metadata.slots.methods.last(),
+        metadata.slots.strings.len(),
+        metadata.slots.strings.last()
+    );
+    ensure!(
+        calls
+            .indices
+            .iter()
+            .all(|&index| (index as usize) < list_count),
+        "metadata call-site index exceeds validated usage-list count {list_count}"
+    );
+    log::info!(
+        "[Script Dumper] verified initialization indices={} call_sites={} unresolved_calls={} max_index={}",
+        calls.indices.len(),
+        calls.sites,
+        calls.unresolved,
+        calls.indices.last().unwrap()
+    );
+    if calls.unresolved > 0 {
+        log::info!(
+            "[Script Dumper] {} initializer call arguments are dynamic/unresolved; initialization uses the validated full usage-list range",
+            calls.unresolved
+        );
+    }
+    log::info!(
+        "[Script Dumper] validated initialization list_count={list_count}; no native fault probing"
+    );
+    progress.stage("initialize validated metadata indices", list_count);
+    let init: extern "C" fn(u32) = unsafe { std::mem::transmute(base + metadata_init_rva) };
+    for index in 0..list_count {
+        progress.step(index, base + metadata_init_rva, "metadata_init");
+        guarded(|| { init(index as u32); Ok(()) }).with_context(|| format!(
+            "metadata_init index={index}; initialization stopped; restart the game before retrying after a native fault"))?;
+    }
+
+    let mut type_infos = HashMap::new();
+    scan_table(
+        progress,
+        "type info",
+        table_va,
+        *offsets.get(&1).context("missing type table offset")?,
+        &metadata.slots.types,
+        |index, slot, raw| {
+            let class = Il2CppClass(raw);
+            progress.step(index, raw, "class type name");
+            let name = class.byval_arg().get_name(Il2CppTypeNameFormat::IL);
+            type_infos.insert(class, slot);
+            out.script_metadata.insert(
+                slot,
+                ScriptMetadata {
+                    address: slot,
+                    name: format!("{name}_TypeInfo"),
+                    signature: format!("{name}_c*"),
+                },
             );
-            (metadata_init_rva, table_rva, offsets)
-        } else {
-            log::debug!("[Script Dumper] Failed to scan address, using the hardcoded one");
+            Ok(())
+        },
+    )?;
 
-            if GET_METADATA_FROM_INDEX_FUNC_PTR == 0 {
-                log::debug!(
-                    "[Script Dumper] Hardcoded offset is not set! aborting script dump."
-                );
-                METADATA_METHODS.set(HashMap::new());
-                return;
-            }
+    let mut metadata_methods: HashMap<i32, HashMap<i32, Vec<MethodInfo>>> = HashMap::new();
+    scan_table(
+        progress,
+        "method info",
+        table_va,
+        *offsets.get(&3).context("missing method table offset")?,
+        &metadata.slots.methods,
+        |index, slot, raw| {
+            let method = Il2CppMethod(raw);
+            progress.step(index, raw, "il2cpp_method_get_class");
+            let class = method.class();
+            ensure!(class.0 != 0, "null declaring class");
+            progress.step(index, raw, "RuntimeType::from_class");
+            let runtime_type = RuntimeType::from_class(class)?;
+            progress.step(index, raw, "MethodInfo::from_handle");
+            let method_info = MethodInfo::from_handle(method)?;
+            ensure!(
+                method_info.0 != 0 && runtime_type.0 != 0,
+                "null reflection metadata"
+            );
+            progress.step(index, raw, "class type name");
+            let name = class.byval_arg().get_name(Il2CppTypeNameFormat::IL);
+            progress.step(index, raw, "class metadata token");
+            let class_token = runtime_type.get_metadata_token();
+            progress.step(index, raw, "method metadata token");
+            let method_token = method_info.get_metadata_token();
+            metadata_methods
+                .entry(class_token)
+                .or_default()
+                .entry(method_token)
+                .or_default()
+                .push(method_info);
+            progress.step(index, raw, "method name and address");
+            out.script_metadata_method.insert(
+                slot,
+                ScriptMetadataMethod {
+                    address: slot,
+                    name: format!("{}_{}", name, method.get_name()),
+                    method_address: method.rva(),
+                },
+            );
+            Ok(())
+        },
+    )?;
 
-            (
-                GET_METADATA_FROM_INDEX_FUNC_PTR,
-                TABLE_BASE,
-                HashMap::from([
-                    (1, TYPEINFO_OFFSET),
-                    (3, METHODINFO_OFFSET),
-                    (6, METHODINFO_OFFSET),
-                    (5, STRINGLITERAL_OFFSET),
-                ]),
+    let mut string_literals = HashMap::new();
+    scan_table(
+        progress,
+        "string literals",
+        table_va,
+        *offsets.get(&5).context("missing string table offset")?,
+        &metadata.slots.strings,
+        |index, slot, raw| {
+            let string = Il2CppString(raw);
+            progress.step(index, raw, "read string literal");
+            string_literals.insert(slot, string);
+            out.script_string.insert(
+                slot,
+                ScriptString {
+                    address: slot,
+                    value: string.as_str(),
+                },
+            );
+            Ok(())
+        },
+    )?;
+
+    ensure!(!type_infos.is_empty(), "Script type-info table is empty");
+    ensure!(
+        !metadata_methods.is_empty(),
+        "Script method-info table is empty"
+    );
+    progress.stage("write script-mini.json", out.script_method.len());
+    let mut writer =
+        BufWriter::with_capacity(64 * 1024, std::fs::File::create("./DUMP/script-mini.json")?);
+    serde_json::to_writer_pretty(&mut writer, &out).context("serialize script-mini.json")?;
+    writer.flush().context("flush script-mini.json")?;
+    log::info!(
+        "[Script Dumper] collected methods={} types={} metadata_methods={} strings={}",
+        out.script_method.len(),
+        out.script_metadata.len(),
+        out.script_metadata_method.len(),
+        out.script_string.len()
+    );
+
+    // The IPC task gate serializes dumpers. Publish only after every stage and
+    // output write succeeds, so a retry cannot reuse a half-complete cache.
+    METHODS
+        .set(methods)
+        .map_err(|_| anyhow::anyhow!("METHODS already published"))?;
+    TYPE_INFOS
+        .set(type_infos)
+        .map_err(|_| anyhow::anyhow!("TYPE_INFOS already published"))?;
+    METADATA_METHODS
+        .set(metadata_methods)
+        .map_err(|_| anyhow::anyhow!("METADATA_METHODS already published"))?;
+    STRING_LITERALS
+        .set(string_literals)
+        .map_err(|_| anyhow::anyhow!("STRING_LITERALS already published"))?;
+    Ok(())
+}
+
+fn guarded<T>(mut work: impl FnMut() -> Result<T>) -> Result<T> {
+    // Catch Rust panics inside the SEH callback, never across its foreign ABI.
+    microseh::try_seh(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut work)))
+        .map_err(|error| anyhow::anyhow!("native fault: {error:?}"))?
+        .map_err(|payload| {
+            anyhow::anyhow!(
+                "panic: {}",
+                payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic")
             )
-        };
+        })?
+}
 
-        let func: extern "C" fn(u32) = std::mem::transmute(*il2cpp::GA_BASE + metadata_init_rva);
+#[cfg(test)]
+mod tests {
+    use super::{BTreeSet, Progress, guarded, visit_table};
 
-        let mut max_index = 0;
+    #[test]
+    fn script_errors_and_panics_return_through_native_boundary() {
+        let error = guarded::<()>(|| anyhow::bail!("metadata test failure")).unwrap_err();
+        assert!(error.to_string().contains("metadata test failure"));
+        let panic = guarded::<()>(|| panic!("metadata test panic")).unwrap_err();
+        assert!(panic.to_string().contains("metadata test panic"));
+    }
 
-        for i in 0..999_999 {
-            if microseh::try_seh(|| {
-                func(i as u32);
-            })
-            .is_err()
-            {
-                max_index = i;
-                break;
-            }
-        }
-
-        log::debug!("[Script Dumper] dumping type info...");
-        let mut type_infos = HashMap::new();
-        for index in 0..999_999 {
-            match microseh::try_seh(|| {
-                let table = *((*((*il2cpp::GA_BASE + table_rva) as *const usize)
-                    + offsets.get(&1).unwrap()) as *const usize);
-                let pointer = table + 8 * index;
-                let table_pointer = pointer - *il2cpp::GA_BASE;
-                let class = *((pointer) as *const Il2CppClass);
-                if class.0 == 0 {
-                    return true;
-                }
-
-                let name = class.byval_arg().get_name(Il2CppTypeNameFormat::IL);
-                let signature = format!("{name}_c*");
-                type_infos.insert(class, table_pointer);
-
-                out.script_metadata.insert(
-                    table_pointer,
-                    ScriptMetadata {
-                        address: table_pointer,
-                        name: format!("{name}_TypeInfo"),
-                        signature,
-                    },
-                );
-
-                false
-            }) {
-                Ok(true) | Err(_) => break,
-                _ => continue,
-            }
-        }
-        TYPE_INFOS.set(type_infos);
-
-        log::debug!("[Script Dumper] dumping method info...");
-        let mut metadata_methods: HashMap<i32, HashMap<i32, Vec<MethodInfo>>> = HashMap::new();
-        for index in 0..999_999 {
-            match microseh::try_seh(|| {
-                let table = *((*((*il2cpp::GA_BASE + table_rva) as *const usize)
-                    + offsets.get(&3).unwrap()) as *const usize);
-                let pointer = table + 8 * index;
-                let table_pointer = pointer - *il2cpp::GA_BASE;
-                let method = *((pointer) as *const Il2CppMethod);
-                if method.0 == 0 {
-                    return true;
-                }
-
-                let runtime_type = RuntimeType::from_class(method.class()).unwrap();
-                let method_info = MethodInfo::from_handle(method).unwrap();
-
-                let name = method
-                    .class()
-                    .byval_arg()
-                    .get_name(Il2CppTypeNameFormat::IL);
-
-                metadata_methods
-                    .entry(runtime_type.get_metadata_token())
-                    .or_default()
-                    .entry(method_info.get_metadata_token())
-                    .or_default()
-                    .push(method_info);
-
-                out.script_metadata_method.insert(
-                    table_pointer,
-                    ScriptMetadataMethod {
-                        address: table_pointer,
-                        name: format!("{}_{}", name, method.get_name()),
-                        method_address: method.rva(),
-                    },
-                );
-
-                false
-            }) {
-                Ok(true) | Err(_) => break,
-                _ => continue,
-            }
-        }
-        METADATA_METHODS.set(metadata_methods).unwrap();
-
-        log::debug!("[Script Dumper] string literal...");
-        let mut string_literals = HashMap::new();
-        for index in 0..999_999 {
-            match microseh::try_seh(|| {
-                let table = *((*((*il2cpp::GA_BASE + table_rva) as *const usize)
-                    + offsets.get(&5).unwrap()) as *const usize);
-                let pointer = table + 8 * index;
-                let table_pointer = pointer - *il2cpp::GA_BASE;
-                let string = *((pointer) as *const Il2CppString);
-                if string.0 == 0 {
-                    return true;
-                }
-
-                string_literals.insert(table_pointer, string);
-
-                out.script_string.insert(
-                    table_pointer,
-                    ScriptString {
-                        address: table_pointer,
-                        value: string.as_str(),
-                    },
-                );
-
-                false
-            }) {
-                Ok(true) | Err(_) => break,
-                _ => continue,
-            }
-        }
-        STRING_LITERALS.set(string_literals);
-
-        std::fs::write(
-            "./DUMP/script-mini.json",
-            serde_json::to_string_pretty(&out).unwrap(),
+    #[test]
+    fn table_traversal_uses_declared_slots_without_null_or_end_probing() {
+        // A hole in a sparse table must not end the scan. Nonzero memory after
+        // the last declared slot must never be interpreted as another object.
+        let table = [101usize, 0, 202, usize::MAX];
+        let progress = Progress::start("Script test").unwrap();
+        let mut visited = Vec::new();
+        visit_table(
+            &progress,
+            "test slots",
+            table.as_ptr() as usize,
+            0,
+            &BTreeSet::from([0, 2]),
+            |index, _, raw| {
+                visited.push((index, raw));
+                Ok(())
+            },
         )
         .unwrap();
+        assert_eq!(visited, [(0, 101), (2, 202)]);
+    }
 
-        log::debug!("[Script Dumper] Done");
+    #[test]
+    fn declared_null_slot_is_an_error_not_a_successful_end() {
+        let table = [0usize];
+        let progress = Progress::start("Script test").unwrap();
+        let error = visit_table(
+            &progress,
+            "test slots",
+            table.as_ptr() as usize,
+            0,
+            &BTreeSet::from([0]),
+            |_, _, _| panic!("null slot must not be visited"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("declared metadata slot is null"));
+    }
+
+    #[test]
+    fn accepts_a_readable_declared_slot_above_the_old_ceiling() {
+        let index = 1_000_001;
+        let mut table = vec![0usize; index + 1];
+        table[index] = 77;
+        let progress = Progress::start("Script test").unwrap();
+        let mut visited = Vec::new();
+        visit_table(
+            &progress,
+            "test slots",
+            table.as_ptr() as usize,
+            0,
+            &BTreeSet::from([index as u32]),
+            |index, _, raw| {
+                visited.push((index, raw));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, [(index, 77)]);
+    }
+
+    #[test]
+    fn invalid_entry_address_fails_before_the_native_visitor() {
+        let progress = Progress::start("Script test").unwrap();
+        for (base, index, expected) in [
+            (0, 0, "null table base"),
+            (1, 0, "unreadable memory"),
+            (usize::MAX - 3, 0, "memory range overflow"),
+            (usize::MAX - 3, 1, "table address overflow"),
+        ] {
+            let error = visit_table(
+                &progress,
+                "test slots",
+                base,
+                0,
+                &BTreeSet::from([index]),
+                |_, _, _| panic!("invalid entry must not be visited"),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 }
 
-fn dump_methods(out: &mut ScriptJson, methods: &mut HashMap<u64, Il2CppMethod>) {
-    log::debug!("[Script Dumper] dumping methods...");
+fn scan_table(
+    progress: &Progress,
+    name: &'static str,
+    root: usize,
+    offset: usize,
+    slots: &BTreeSet<u32>,
+    visit: impl FnMut(usize, usize, usize) -> Result<()>,
+) -> Result<()> {
+    progress.stage(name, slots.len());
+    progress.step(0, root, "read table base");
+    let table = guarded(|| unsafe {
+        let container = memory::read_pointer(root)?;
+        ensure!(container != 0, "null table container");
+        let table = memory::read_pointer(memory::element_address(container, offset, 1)?)?;
+        ensure!(table != 0, "null table base");
+        Ok(table)
+    })
+    .with_context(|| format!("{name}: read table base"))?;
+    visit_table(progress, name, table, *il2cpp::GA_BASE, slots, visit)
+}
 
-    let mut method_idx = 0;
-    for typedef_index in 0..unsafe { MAX_TYPEDEFINDEX } {
-        let class = il2cpp::vm::metadata_cache::get_typeinfo_from_typedefindex(typedef_index);
-        let name = class.byval_arg().get_name(Il2CppTypeNameFormat::IL);
-        for method in class.get_methods() {
-            out.script_method.insert(
-                method_idx,
-                ScriptMethod {
-                    address: method.rva(),
-                    name: format!("{}$${}", name, method.get_name()),
-                    signature: String::new(),
-                    type_signature: String::new(),
-                },
-            );
-            methods.insert(method.rva() as u64, method);
-            method_idx += 1;
-        }
+fn visit_table(
+    progress: &Progress,
+    name: &'static str,
+    table: usize,
+    game_base: usize,
+    slots: &BTreeSet<u32>,
+    mut visit: impl FnMut(usize, usize, usize) -> Result<()>,
+) -> Result<()> {
+    for &index in slots {
+        let index = index as usize;
+        let pointer = memory::element_address(table, index, size_of::<usize>())
+            .with_context(|| format!("{name} index={index}"))?;
+        progress.step(index, pointer, "read table entry");
+        let raw = guarded(|| unsafe { memory::read_pointer(pointer) })
+            .with_context(|| format!("{name} index={index} slot=0x{pointer:X}"))?;
+        ensure!(
+            raw != 0,
+            "{name} index={index} slot=0x{pointer:X}: declared metadata slot is null after initialization"
+        );
+        let slot = pointer
+            .checked_sub(game_base)
+            .context("metadata slot is below GameAssembly base")?;
+        guarded(|| visit(index, slot, raw)).with_context(|| progress.summary())?;
     }
+    log::info!(
+        "[Script Dumper] stage={name} entries={} max_index={:?} end=metadata-bound",
+        slots.len(),
+        slots.last()
+    );
+    Ok(())
+}
 
-    log::debug!("[Script Dumper] dump_methods done");
+fn dump_methods(
+    out: &mut ScriptJson,
+    methods: &mut HashMap<u64, Il2CppMethod>,
+    progress: &Progress,
+) -> Result<()> {
+    let count = unsafe { MAX_TYPEDEFINDEX };
+    progress.stage("method definitions", count as usize);
+    let mut method_idx = 0;
+    for typedef_index in 0..count {
+        progress.step(typedef_index as usize, 0, "enumerate class methods");
+        guarded(|| {
+            let class = il2cpp::vm::metadata_cache::get_typeinfo_from_typedefindex(typedef_index);
+            let name = class.byval_arg().get_name(Il2CppTypeNameFormat::IL);
+            for method in class.get_methods() {
+                out.script_method.insert(
+                    method_idx,
+                    ScriptMethod {
+                        address: method.rva(),
+                        name: format!("{}$${}", name, method.get_name()),
+                        signature: String::new(),
+                        type_signature: String::new(),
+                    },
+                );
+                methods.insert(method.rva() as u64, method);
+                method_idx += 1;
+            }
+            Ok(())
+        })
+        .with_context(|| format!("method definitions typedef_index={typedef_index}"))?;
+    }
+    log::info!("[Script Dumper] method definitions={method_idx}");
+    Ok(())
 }
 
 fn scan_address() -> Option<(usize, usize, HashMap<usize, usize>)> {
@@ -322,7 +533,7 @@ fn scan_address() -> Option<(usize, usize, HashMap<usize, usize>)> {
     let slice = game_assembly_slice();
     let mut decoder = Decoder::with_ip(
         64,
-        &slice[metadata_init_rva..],
+        slice.get(metadata_init_rva..slice.len().min(metadata_init_rva.checked_add(4096)?))?,
         (*il2cpp::GA_BASE + metadata_init_rva) as u64,
         DecoderOptions::NONE,
     );
@@ -339,7 +550,9 @@ fn scan_address() -> Option<(usize, usize, HashMap<usize, usize>)> {
         // Find the lea instruction that loads the jump table base
         if instruction.mnemonic() == Mnemonic::Lea && instruction.op0_register() == Register::RDI {
             // This is: lea     rdi, jpt_1838E8730
-            jump_table_base = Some(instruction.near_branch64());
+            if instruction.is_ip_rel_memory_operand() {
+                jump_table_base = Some(instruction.ip_rel_memory_address());
+            }
         }
 
         // Find the max case comparison
@@ -371,7 +584,10 @@ fn scan_address() -> Option<(usize, usize, HashMap<usize, usize>)> {
         // Calculate the actual jump table address
         // In the assembly: jpt_181488F6F - 181489260h
         // So the full address is base + offset
-        let jump_table_addr = base.wrapping_add(offset as u64);
+        if max > 32 {
+            return None;
+        }
+        let jump_table_addr = base.wrapping_add_signed(offset as i32 as i64);
 
         // Read each case from the jump table
         for case_idx in 0..=max {
@@ -397,7 +613,9 @@ fn scan_address() -> Option<(usize, usize, HashMap<usize, usize>)> {
             let offset_addr = jump_table_addr + table_offset;
 
             // Safety: Ensure we're reading within bounds
-            if offset_addr + 4 <= (*il2cpp::GA_BASE + slice.len()) as u64 {
+            if offset_addr >= *il2cpp::GA_BASE as u64
+                && offset_addr.checked_add(4)? <= (*il2cpp::GA_BASE + slice.len()) as u64
+            {
                 let slice_offset = offset_addr as usize - *il2cpp::GA_BASE;
                 let offset = i32::from_le_bytes([
                     slice[slice_offset],
@@ -420,9 +638,14 @@ fn scan_address() -> Option<(usize, usize, HashMap<usize, usize>)> {
     }
 
     fn get_table_and_offset(addr: u64) -> Option<(usize, usize)> {
-        let rva = addr as usize - *il2cpp::GA_BASE;
+        let rva = (addr as usize).checked_sub(*il2cpp::GA_BASE)?;
         let slice = game_assembly_slice();
-        let mut decoder = Decoder::with_ip(64, &slice[rva..], addr, DecoderOptions::NONE);
+        let mut decoder = Decoder::with_ip(
+            64,
+            slice.get(rva..slice.len().min(rva.checked_add(128)?))?,
+            addr,
+            DecoderOptions::NONE,
+        );
 
         let mut instruction = Instruction::default();
 

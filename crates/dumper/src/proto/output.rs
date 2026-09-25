@@ -1,6 +1,6 @@
 use super::{MessageMinimalInfo, cache::TypeCache};
 
-use crate::proto::{NumberType, RETCODE_FIELD_NAME, cache::CachedType, nt};
+use crate::proto::{NumberType, RETCODE_FIELD_NAME, cache::CachedType};
 use convert_case::{Case, Casing as _};
 use il2cpp::vm::{metadata_cache, object::Il2CppObject, string::Il2CppString, value::Il2CppValue};
 use indexmap::IndexMap;
@@ -249,13 +249,14 @@ fn process_cmd_id(
     map: &mut IndexMap<RuntimeType, Rc<RefCell<ProtoItem>>>,
     rsp_notify_map: &HashMap<String, u16>,
     req_map: &HashMap<String, (u16, Option<String>)>,
+    rsp_notify_names: &HashMap<String, String>,
     method_nt_map: &HashMap<String, String>,
 ) -> (HashMap<i32, String>, HashMap<String, String>) {
     let array = map.values_mut().collect::<Vec<_>>();
 
     let mut message_usages: HashMap<String, u32> = HashMap::with_capacity(array.len());
     let mut cmd_ids: HashMap<i32, String> = HashMap::new();
-    let mut nt_map: HashMap<String, String> = nt::get_rsp_notify_names();
+    let mut nt_map = rsp_notify_names.clone();
     for (obf_name, deobf_name) in method_nt_map {
         nt_map.insert(obf_name.clone(), deobf_name.clone());
     }
@@ -515,6 +516,7 @@ pub fn generate_protobuf<W: Write>(
     minimal_info_map: &HashMap<RuntimeType, MessageMinimalInfo>,
     rsp_notify_map: &HashMap<RuntimeType, u16>,
     req_map: &HashMap<RuntimeType, (u16, Option<String>)>,
+    rsp_notify_names: &HashMap<String, String>,
     method_nt_map: &HashMap<String, String>,
     predeobf_map: &HashMap<String, String>,
     mut out: W,
@@ -788,6 +790,7 @@ pub fn generate_protobuf<W: Write>(
                 )
             })
             .collect::<HashMap<_, _>>(),
+        rsp_notify_names,
         method_nt_map,
     );
 

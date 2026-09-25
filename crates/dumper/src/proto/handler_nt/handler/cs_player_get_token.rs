@@ -104,7 +104,8 @@ pub fn process(type_to_item: &TypeToItemMap) -> HashMap<String, String> {
         }
 
         if (insn.mnemonic() == Mnemonic::Call || insn.mnemonic() == Mnemonic::Jmp)
-            && insn.near_branch_target() as usize - ga_base == obj_new_rva
+            && crate::proto::asm_address::direct_branch_rva(&insn, ga_base, slice.len())
+                == Some(obj_new_rva)
         {
             alloc_seen = true;
         }
@@ -161,7 +162,8 @@ pub fn process(type_to_item: &TypeToItemMap) -> HashMap<String, String> {
         }
 
         if insn.mnemonic() == Mnemonic::Call {
-            last_call_target = Some(insn.near_branch_target());
+            last_call_target =
+                crate::proto::asm_address::direct_branch_target(&insn).map(|va| va as u64);
             for r in [
                 Register::RAX,
                 Register::RCX,

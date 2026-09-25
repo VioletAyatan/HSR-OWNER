@@ -100,7 +100,8 @@ pub fn process(type_to_item: &TypeToItemMap) -> HashMap<String, String> {
         }
 
         if (insn.mnemonic() == Mnemonic::Call || insn.mnemonic() == Mnemonic::Jmp)
-            && insn.near_branch_target() as usize - ga_base == obj_new_rva
+            && crate::proto::asm_address::direct_branch_rva(&insn, ga_base, slice.len())
+                == Some(obj_new_rva)
             && let Some((reg, disp)) = rip_load
             && reg == Register::RCX
         {

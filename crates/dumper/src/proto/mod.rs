@@ -5,6 +5,7 @@ use std::{
     sync::LazyLock,
 };
 
+use crate::dump_progress::Progress;
 use cache::{CachedType, TypeCache};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic};
 use il2cpp::{
@@ -14,6 +15,7 @@ use il2cpp::{
 use reflection::{property_info::PropertyInfo, runtime_type::RuntimeType};
 use utils::game_assembly_slice;
 
+mod asm_address;
 mod cache;
 pub mod handler_nt;
 mod logic_nt;
@@ -23,29 +25,42 @@ mod nt;
 mod output;
 mod proto_asm_parser;
 mod proto_stream;
+mod rsp_scan;
 pub mod util;
 mod write_to;
 
 static IL2CPP_OBJECT_NEW_API_RVA: LazyLock<usize> = LazyLock::new(|| unsafe {
     let api_ptr_addr = (*il2cpp::API_BASE_PTR) + 8 * 130;
     let api_addr = *((*il2cpp::UP_BASE + api_ptr_addr) as *const usize);
-    api_addr - *il2cpp::GA_BASE
+    asm_address::module_rva(api_addr, *il2cpp::GA_BASE, game_assembly_slice().len()).unwrap_or_else(
+        || {
+            log::warn!(
+                "[Proto Dumper] object allocator API is outside GameAssembly: va=0x{api_addr:X}"
+            );
+            0
+        },
+    )
 });
 
 static IL2CPP_OBJECT_NEW_RVA: LazyLock<usize> = LazyLock::new(|| {
     let api_rva = *IL2CPP_OBJECT_NEW_API_RVA;
+    if api_rva == 0 {
+        return 0;
+    }
     let slice = game_assembly_slice();
     let mut decoder = Decoder::with_ip(
         64,
-        &slice[api_rva..api_rva + 0x80],
+        &slice[api_rva..api_rva.saturating_add(0x80).min(slice.len())],
         (*il2cpp::GA_BASE + api_rva) as u64,
         DecoderOptions::NONE,
     );
     let mut instruction = Instruction::default();
     while decoder.can_decode() {
         decoder.decode_out(&mut instruction);
-        if instruction.mnemonic() == Mnemonic::Call {
-            let real_rva = (instruction.near_branch_target() as usize) - *il2cpp::GA_BASE;
+        if instruction.mnemonic() == Mnemonic::Call
+            && let Some(real_rva) =
+                asm_address::direct_branch_rva(&instruction, *il2cpp::GA_BASE, slice.len())
+        {
             log::debug!("[Proto Dumper] Il2CppObject::New => 0x{real_rva:X}");
             return real_rva;
         }
@@ -90,7 +105,11 @@ static XLUA_REGISTER_OBJECT_RVA: LazyLock<usize> = LazyLock::new(|| {
         .and_then(|idx| methods.get(idx + 1))
     {
         let va = next.get_il2cpp_method().va();
-        let rva = va - *il2cpp::GA_BASE;
+        let Some(rva) = asm_address::module_rva(va, *il2cpp::GA_BASE, game_assembly_slice().len())
+        else {
+            log::warn!("[Proto Dumper] XLua RegisterObject is outside GameAssembly: va=0x{va:X}");
+            return 0;
+        };
         log::debug!("[Proto Dumper] XLua::RegisterObject => 0x{rva:X}");
         return rva;
     }
@@ -194,10 +213,15 @@ pub static NETWORK_MANAGER_SEND_VA: LazyLock<usize> = LazyLock::new(|| {
                     .and_then(|m| m.first())
             {
                 let va = m_method.get_il2cpp_method().va();
-                log::debug!(
-                    "[Proto Dumper] NetworkManager::Send2 => 0x{:X}",
-                    va - *il2cpp::GA_BASE
-                );
+                let Some(rva) =
+                    asm_address::module_rva(va, *il2cpp::GA_BASE, game_assembly_slice().len())
+                else {
+                    log::warn!(
+                        "[Proto Dumper] NetworkManager::Send2 is outside GameAssembly: va=0x{va:X}"
+                    );
+                    return 0;
+                };
+                log::debug!("[Proto Dumper] NetworkManager::Send2 => 0x{:X}", rva);
                 return va;
             }
         }
@@ -262,6 +286,7 @@ static XLUA_OBJECT_TRANSLATOR_DELEGATE: LazyLock<Cow<'static, str>> = LazyLock::
         .unwrap()
         .iter()
         .position(|&v| v == obj_translator_method_class)
+        .and_then(|index| index.checked_sub(1))
     else {
         log::debug!(
             "[Proto Dumper] failed to find XLUA_OBJECT_TRANSLATOR_METHOD_CLASS to get XLUA_OBJECT_TRANSLATOR_DELEGATE"
@@ -270,7 +295,7 @@ static XLUA_OBJECT_TRANSLATOR_DELEGATE: LazyLock<Cow<'static, str>> = LazyLock::
     };
 
     let the_class =
-        metadata_cache::get_typeinfo_from_typedefindex((obj_translator_method_idx - 1) as u32);
+        metadata_cache::get_typeinfo_from_typedefindex(obj_translator_method_idx as u32);
 
     let the_class_name = the_class.byval_arg().il_name();
 
@@ -294,6 +319,7 @@ static XLUA_OBJECT_TRANSLATOR_METHOD_CLASS: LazyLock<Cow<'static, str>> = LazyLo
         .unwrap()
         .iter()
         .position(|&v| v == obj_translator_static_class)
+        .and_then(|index| index.checked_sub(1))
     else {
         log::debug!(
             "[Proto Dumper] failed to find XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS to get XLUA_OBJECT_TRANSLATOR_METHOD_CLASS"
@@ -302,7 +328,7 @@ static XLUA_OBJECT_TRANSLATOR_METHOD_CLASS: LazyLock<Cow<'static, str>> = LazyLo
     };
 
     let the_class =
-        metadata_cache::get_typeinfo_from_typedefindex((obj_translator_static_idx - 1) as u32);
+        metadata_cache::get_typeinfo_from_typedefindex(obj_translator_static_idx as u32);
 
     let the_class_name = the_class.byval_arg().il_name();
 
@@ -325,6 +351,7 @@ static XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS: LazyLock<Cow<'static, str>> =
             .unwrap()
             .iter()
             .position(|&v| v == gen_13_wrap_class)
+            .and_then(|index| index.checked_sub(1))
         else {
             log::debug!(
                 "[Proto Dumper] failed to find XLua.CSObjectWrap.Gen_13_Wrap to get XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS"
@@ -332,8 +359,7 @@ static XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS: LazyLock<Cow<'static, str>> =
             return Cow::Borrowed("");
         };
 
-        let the_class =
-            metadata_cache::get_typeinfo_from_typedefindex((gen_13_wrap_idx - 1) as u32);
+        let the_class = metadata_cache::get_typeinfo_from_typedefindex(gen_13_wrap_idx as u32);
 
         let the_class_name = the_class.byval_arg().il_name();
 
@@ -413,17 +439,50 @@ pub fn dump<W: Write>(
     dump_mode: ProtoDumpMode,
     enable_logging: bool,
 ) -> io::Result<()> {
+    let progress = Progress::start("Proto").map_err(io::Error::other)?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dump_inner(out, cmdid_out, dump_mode, enable_logging, &progress)
+    }))
+    .unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        Err(io::Error::other(format!(
+            "{}: panic: {message}",
+            progress.summary()
+        )))
+    });
+    progress.finish(&result);
+    result
+}
+
+fn dump_inner<W: Write>(
+    out: &mut W,
+    cmdid_out: &mut W,
+    dump_mode: ProtoDumpMode,
+    enable_logging: bool,
+    progress: &Progress,
+) -> io::Result<()> {
+    progress.stage("initialize type cache", 0);
     let type_cache = TypeCache::init();
+    progress.stage("initialize proto stream", 0);
     proto_stream::init();
 
     log::debug!("[Proto Dumper] dumping minimal proto infos...");
 
     let mut minimal_info_map = HashMap::<RuntimeType, MessageMinimalInfo>::new();
+    progress.stage("response/notify mapping", 0);
     let mut rsp_notify_map = nt::get_rsp_notify_map();
     let mut req_map = HashMap::<RuntimeType, (u16, Option<String>)>::new();
 
-    for i in unsafe { il2cpp::RPG_NETWORK_PROTO_START }..unsafe { il2cpp::RPG_NETWORK_PROTO_END } {
+    let start = unsafe { il2cpp::RPG_NETWORK_PROTO_START };
+    let end = unsafe { il2cpp::RPG_NETWORK_PROTO_END };
+    progress.stage("minimal proto info", end.saturating_sub(start) as usize);
+    for i in start..end {
         let proto_class = metadata_cache::get_typeinfo_from_typedefindex(i);
+        progress.step((i - start) as usize, proto_class.0, "inspect proto class");
         let proto_type = RuntimeType::from_class(proto_class).unwrap();
 
         let Some(merge_from) = proto_type.find_method_il2cpp(MERGE_FROM) else {
@@ -447,6 +506,11 @@ pub fn dump<W: Write>(
                 .rva();
         message_info.write_to_rva = write_to_method.rva();
 
+        progress.step(
+            (i - start) as usize,
+            write_to_method.va(),
+            "extract proto fields",
+        );
         match dump_mode {
             ProtoDumpMode::ClassFieldNumber => {
                 util::generate_minimal_info_from_constants(
@@ -494,7 +558,8 @@ pub fn dump<W: Write>(
 
     log::debug!("[Proto Dumper] generating nt...");
 
-    let req_rvas = nt::get_req_map(&minimal_info_map, &rsp_notify_map, &mut req_map);
+    progress.stage("request name mapping", minimal_info_map.len());
+    let req_rvas = nt::get_req_map(&minimal_info_map, &rsp_notify_map, &mut req_map, progress);
     let req_named_count = req_map.values().filter(|(_, name)| name.is_some()).count();
     log::debug!(
         "[Proto Dumper] req nt: req={}, nt={}",
@@ -502,14 +567,20 @@ pub fn dump<W: Write>(
         req_named_count
     );
 
-    let rsp_notify_names = nt::get_rsp_notify_names();
+    progress.stage("response/notify names", rsp_notify_map.len());
+    let response_mappings =
+        nt::collect_rsp_notify_mappings(&minimal_info_map, progress).map_err(io::Error::other)?;
+    let rsp_notify_names = &response_mappings.names;
+    progress.stage("method handler names", 0);
     let (method_handler_map, method_nt_map) = method_nt::get_method_nt_map();
 
+    progress.stage("prepare message names", minimal_info_map.len());
     let (cmd_ids, proto_name_map, type_to_item) = output::generate_protobuf(
         &type_cache,
         &minimal_info_map,
         &rsp_notify_map,
         &req_map,
+        rsp_notify_names,
         &method_nt_map,
         &HashMap::new(),
         std::io::sink(),
@@ -553,15 +624,20 @@ pub fn dump<W: Write>(
     };
 
     let sc_packet_handlers = {
+        progress.stage("response handler addresses", 0);
         let mut method_map: HashMap<RuntimeType, Vec<String>> = HashMap::new();
         let mut proto_param_map: HashMap<RuntimeType, Vec<String>> = HashMap::new();
-        let rsp_notify_method_rvas = nt::get_rsp_notify_method_rvas();
+        let rsp_notify_method_rvas = &response_mappings.method_rvas;
 
-        for i in 0..unsafe { il2cpp::MAX_TYPEDEFINDEX } {
+        let count = unsafe { il2cpp::MAX_TYPEDEFINDEX };
+        progress.stage("scan handler parameters", count as usize);
+        for i in 0..count {
+            progress.step(i as usize, 0, "inspect handler class");
             if let Ok(runtime_type) =
                 RuntimeType::from_class(metadata_cache::get_typeinfo_from_typedefindex(i))
             {
                 for method in runtime_type.get_methods_il2cpp() {
+                    progress.step(i as usize, method.0, "inspect handler method parameters");
                     let args = method.get_parameters();
                     for arg in args {
                         if let Ok(arg_type) = arg.get_parameter_type()
@@ -605,11 +681,11 @@ pub fn dump<W: Write>(
             for cmd_rva in cmd_rvas {
                 if cmd_rva != "0x0" {
                     let key = rsp_notify_names
-                        .get(&formatted_name)
+                        .get(formatted_name)
                         .cloned()
                         .unwrap_or(formatted_name.clone());
 
-                    result_map.entry(key).or_default().push(cmd_rva);
+                    result_map.entry(key).or_default().push(cmd_rva.clone());
                 }
             }
         }
@@ -634,36 +710,42 @@ pub fn dump<W: Write>(
         result_map
     };
 
+    progress.stage("global field names", 0);
     let mut proto_field_map = method_nt::dump_global_field_map();
+    progress.stage("handler field names", type_to_item.len());
     for (k, v) in handler_nt::get_handler_nt_map(&type_to_item) {
         proto_field_map.entry(k).or_insert(v);
     }
 
     let logic_field_map = proto_field_map.clone();
 
+    progress.stage("logic field names", type_to_item.len());
     logic_nt::run_logic_nt(
         &type_to_item.values().cloned().collect::<Vec<_>>(),
         &proto_name_map,
         &logic_field_map,
     );
 
+    progress.stage("write handler metadata", 0);
     std::fs::write(
         "./DUMP/cs-type-infos.json",
-        serde_json::to_string_pretty(&cs_type_infos).unwrap(),
-    );
+        serde_json::to_string_pretty(&cs_type_infos)?,
+    )?;
 
     std::fs::write(
         "./DUMP/sc-packet-handlers.json",
-        serde_json::to_string_pretty(&sc_packet_handlers).unwrap(),
-    );
+        serde_json::to_string_pretty(&sc_packet_handlers)?,
+    )?;
 
     log::debug!("[Proto Dumper] generating protobuf...");
+    progress.stage("write protobuf", minimal_info_map.len());
 
     let (cmd_ids_final, nt_map_final, _type_to_item) = output::generate_protobuf(
         &type_cache,
         &minimal_info_map,
         &rsp_notify_map,
         &req_map,
+        rsp_notify_names,
         &method_nt_map,
         &proto_field_map,
         out,
@@ -675,6 +757,7 @@ pub fn dump<W: Write>(
             .or_insert_with(|| deobf_name);
     }
 
+    progress.stage("write packet IDs", 0);
     writeln!(
         cmdid_out,
         "{}",

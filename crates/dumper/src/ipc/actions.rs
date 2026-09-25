@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use anyhow::Context;
 use hsr_ipc::{DumperAction, ProtoDumpMode};
 
 use crate::{csharp, parser_data, proto, res, runtime, script, script_v2};
@@ -14,9 +15,12 @@ pub fn run(action: DumperAction) -> anyhow::Result<()> {
 
     match action {
         DumperAction::Proto { mode } => dump_proto(mode)?,
-        DumperAction::CSharp => csharp::dump(false)?,
+        DumperAction::CSharp => {
+            prepare_script_metadata("C#")?;
+            csharp::dump(false)?;
+        }
         DumperAction::ParserData => parser_data::dump(),
-        DumperAction::Script => script::dump(),
+        DumperAction::Script => script::dump()?,
         DumperAction::ScriptV2 => script_v2::dump(),
         DumperAction::Resources => unreachable!("Resources has its own diagnostic boundary"),
     }
@@ -32,20 +36,20 @@ pub fn ensure_dump_folder() -> std::io::Result<()> {
     Ok(())
 }
 
+fn prepare_script_metadata(consumer: &str) -> anyhow::Result<()> {
+    if !script::is_ready() {
+        log::info!("[{consumer} Dumper] preparing Script metadata prerequisite...");
+        script::dump().context("Script metadata prerequisite")?;
+    }
+    anyhow::ensure!(
+        script::is_ready(),
+        "Script metadata prerequisite did not publish all caches"
+    );
+    Ok(())
+}
+
 fn dump_proto(mode: ProtoDumpMode) -> anyhow::Result<()> {
-    if crate::script::TYPE_INFOS.get().is_none() || crate::script::METADATA_METHODS.get().is_none()
-    {
-        log::info!("[Proto Dumper] preparing Script metadata prerequisite...");
-        crate::script::dump();
-    }
-
-    if crate::script::TYPE_INFOS.get().is_none() {
-        anyhow::bail!("Script metadata prerequisite failed: TYPE_INFOS was not initialized");
-    }
-    if crate::script::METADATA_METHODS.get().is_none() {
-        anyhow::bail!("Script metadata prerequisite failed: METADATA_METHODS was not initialized");
-    }
-
+    prepare_script_metadata("Proto")?;
     log::info!("[Proto Dumper] starting mode {mode:?}");
     proto::dump(
         &mut std::fs::File::create("./DUMP/StarRail.proto")?,

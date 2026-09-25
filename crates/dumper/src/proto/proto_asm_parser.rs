@@ -59,8 +59,9 @@ pub fn dump_from_write_to_asm(
         }
 
         if instruction.mnemonic() == Mnemonic::Call {
-            let call_target_rva = instruction.near_branch_target() as usize - *il2cpp::GA_BASE;
-            if call_target_rva == write_raw_byte_rva {
+            if super::asm_address::direct_branch_rva(&instruction, *il2cpp::GA_BASE, slice.len())
+                == Some(write_raw_byte_rva)
+            {
                 cur_movs.reverse();
 
                 let mut next_inst = Instruction::default();
