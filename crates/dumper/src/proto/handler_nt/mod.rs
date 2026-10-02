@@ -28,6 +28,5 @@ pub fn get_handler_nt_map(
         cs_handlers,
     ));
     map.extend(handler::player_sync_sc_notify::process(type_to_item));
-    map.extend(handler::gate_server::process_all(type_to_item));
     map
 }

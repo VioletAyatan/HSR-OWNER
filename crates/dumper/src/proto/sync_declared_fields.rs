@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use il2cpp::api;
 use reflection::{attributes::FieldAttributes, field_info::FieldInfo, runtime_type::RuntimeType};
 
-use super::{Accessor, SyncFields, TypeCache, accessor_kind, checked_name, references};
+use super::{Accessor, CachedType, SyncFields, TypeCache, accessor_kind, checked_name, references};
 use crate::script::memory;
 
 const DECLARED_INSTANCE_FIELDS: i32 = 2 | 4 | 16 | 32;
@@ -89,12 +89,10 @@ pub(super) fn collect(
         &mut out.context,
         format!("declared fields owner=0x{:X}", owner.0),
     );
-    let result = collect_inner(owner, cache, out);
+    let result = collect_inner(owner, cache, out)
+        .with_context(|| format!("declared fields owner=0x{:X}", owner.0));
     out.context = previous_context;
-    result.map_err(|error| {
-        out.failure(format!("declared fields owner=0x{:X}: {error:#}", owner.0));
-        error
-    })
+    result
 }
 
 fn collect_inner(
@@ -161,10 +159,10 @@ fn collect_inner(
             reflected_type_handle.0 != 0,
             "field has null reflected Il2CppType"
         );
-        memory::readable(reflected_type_handle.0, 8)?;
+        memory::readable(reflected_type_handle.0, 16)?;
         let native_type = api::il2cpp_field_get_type(raw);
         ensure!(native_type.0 != 0, "native field has null Il2CppType");
-        memory::readable(native_type.0, 8)?;
+        memory::readable(native_type.0, 16)?;
         ensure!(
             api::il2cpp_type_equals(native_type, reflected_type_handle),
             "native and reflection field types disagree"
@@ -174,7 +172,16 @@ fn collect_inner(
         let (kind, bytes) = accessor
             .map(|(kind, bytes)| (Some(kind), Some(bytes)))
             .unwrap_or((None, None));
-        let span = FieldSpan::checked(field.get_offset(), bytes, instance_size)?;
+        // A non-recoverable primitive still has a known layout width. It must
+        // block only its actual bytes, rather than all later instance fields.
+        let layout_width = bytes.or_else(|| match cache.type_map.get(&reflected_type) {
+            Some(CachedType::Byte | CachedType::SByte) => Some(1),
+            Some(CachedType::UInt16 | CachedType::Int16) => Some(2),
+            Some(CachedType::Single) => Some(4),
+            Some(CachedType::Double) => Some(8),
+            _ => None,
+        });
+        let span = FieldSpan::checked(field.get_offset(), layout_width, instance_size)?;
         let name = recoverable_name(&raw_name).filter(|_| kind.is_some());
         declared.push(DeclaredField {
             span,
@@ -198,6 +205,7 @@ fn collect_inner(
                 getter_rva: 0,
                 setter_rva: 0,
                 member_kind: "declared-field",
+                name_proof: None,
             }
         })
         .collect())

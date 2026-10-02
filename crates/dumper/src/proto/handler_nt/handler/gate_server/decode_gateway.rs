@@ -13,7 +13,14 @@ pub fn set_proto_fields(fields: HashMap<u32, String>) {
     *cache = Some(fields);
 }
 
-pub fn run() -> HashMap<String, String> {
+#[derive(Default)]
+pub(super) struct ContentNames {
+    pub names: HashMap<String, String>,
+    pub evidence: HashMap<u32, serde_json::Value>,
+    pub summary: serde_json::Value,
+}
+
+pub(super) fn run() -> ContentNames {
     let proto_fields = PROTO_FIELDS
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -23,7 +30,7 @@ pub fn run() -> HashMap<String, String> {
         log::warn!(
             "[Gateway] content inference skipped: current GateServer field metadata is unavailable"
         );
-        return HashMap::new();
+        return ContentNames::default();
     }
 
     let version = &*GAME_VERSION;
@@ -31,30 +38,21 @@ pub fn run() -> HashMap<String, String> {
 
     let Some(dispatch_url) = dispatch::get_dispatch_url() else {
         log::warn!("[Gateway] content inference skipped: dispatch URL lookup returned no URL");
-        return HashMap::new();
+        return ContentNames::default();
     };
-    let full_dispatch_url = format!(
-        "{dispatch_url}?version={version}&language_type=3&platform_type=3&channel_id=1&sub_channel_id=1&is_new_format=1"
-    );
-    log::debug!("[Gateway] dispatch_url = {full_dispatch_url}");
 
     let Some(gateway_url) = dispatch::fetch_gateway_url(&dispatch_url, version) else {
         log::warn!(
             "[Gateway] content inference skipped: dispatch fetch/decoding returned no gateway URL"
         );
-        return HashMap::new();
+        return ContentNames::default();
     };
-
-    let full_gateway_url = format!(
-        "{gateway_url}?version={version}&platform_type=1&language_type=3&dispatch_seed={seed}&channel_id=1&sub_channel_id=1&is_need_url=1"
-    );
-    log::debug!("[Gateway] gateway_url = {full_gateway_url}");
 
     let Some(result) = dispatch::fetch_gateway_response(&gateway_url, version, seed) else {
         log::warn!(
             "[Gateway] content inference skipped: gateway fetch/decoding returned no response"
         );
-        return HashMap::new();
+        return ContentNames::default();
     };
 
     let mut candidates = Vec::new();
@@ -115,12 +113,31 @@ pub fn run() -> HashMap<String, String> {
         resolution.unmapped_tags
     );
 
-    resolution.names
+    ContentNames {
+        evidence: resolution
+            .resolved_tags
+            .into_iter()
+            .map(|(tag, class)| {
+                (
+                    tag,
+                    serde_json::json!({
+                        "tag":tag,"class":class,"distinct_tags_for_class":1,"classes_for_tag":1,
+                        "binding":"unique-current-response-content-class"
+                    }),
+                )
+            })
+            .collect(),
+        summary: serde_json::json!({"candidate_tags":resolution.candidate_tags,"restored":resolution.names.len(),
+            "ambiguous_names":resolution.ambiguous_names.len(),"conflicting_tags":resolution.conflicting_tags.len(),
+            "unmapped_tags":resolution.unmapped_tags}),
+        names: resolution.names,
+    }
 }
 
 #[derive(Debug, Default)]
 struct CandidateResolution {
     names: HashMap<String, String>,
+    resolved_tags: HashMap<u32, &'static str>,
     candidate_tags: usize,
     ambiguous_names: BTreeMap<&'static str, BTreeSet<u32>>,
     conflicting_tags: BTreeMap<u32, BTreeSet<&'static str>>,
@@ -165,6 +182,7 @@ fn resolve_candidates(
             && let Some(obf_name) = proto_fields.get(&tag)
         {
             result.names.insert(obf_name.clone(), name.to_string());
+            result.resolved_tags.insert(tag, name);
         }
     }
     result

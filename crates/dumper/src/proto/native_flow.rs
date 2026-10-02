@@ -36,6 +36,8 @@ pub(super) struct Statistics {
     pub cache_hits: usize,
     pub terminal_calls: usize,
     pub exceptional_edges: usize,
+    pub switch_dispatches: usize,
+    pub switch_targets: usize,
     pub planned_callers: usize,
     pub unsupported_callers: usize,
 }
@@ -616,6 +618,8 @@ impl<'a> Resolver<'a> {
         self.stats.terminal_calls += plan.terminal_calls.len();
         self.stats.exceptional_edges +=
             plan.exceptional_edges.values().map(Vec::len).sum::<usize>();
+        self.stats.switch_dispatches += plan.switch_edges.len();
+        self.stats.switch_targets += plan.switch_edges.values().map(Vec::len).sum::<usize>();
         Ok(plan)
     }
 

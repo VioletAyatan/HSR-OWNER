@@ -17,7 +17,7 @@ use reflection::{method_info::MethodInfo, runtime_type::RuntimeType};
 use serde::{Serialize, Serializer, ser::SerializeStruct as _};
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::OnceLock,
 };
 use utils::{game_assembly_slice, scan_ga_section};
@@ -94,10 +94,12 @@ pub static METADATA_METHODS: OnceLock<HashMap<i32, HashMap<i32, Vec<MethodInfo>>
     OnceLock::new();
 pub static TYPE_INFOS: OnceLock<HashMap<Il2CppClass, usize>> = OnceLock::new();
 pub static METHODS: OnceLock<HashMap<u64, Il2CppMethod>> = OnceLock::new();
+pub static METHODS_SHARED_RVAS: OnceLock<HashSet<u64>> = OnceLock::new();
 pub static STRING_LITERALS: OnceLock<HashMap<usize, Il2CppString>> = OnceLock::new();
 
 pub(crate) fn is_ready() -> bool {
     METHODS.get().is_some()
+        && METHODS_SHARED_RVAS.get().is_some()
         && TYPE_INFOS.get().is_some()
         && METADATA_METHODS.get().is_some()
         && STRING_LITERALS.get().is_some()
@@ -113,6 +115,7 @@ pub fn dump() -> Result<()> {
 fn dump_inner(progress: &Progress) -> Result<()> {
     let initialized = [
         METHODS.get().is_some(),
+        METHODS_SHARED_RVAS.get().is_some(),
         TYPE_INFOS.get().is_some(),
         METADATA_METHODS.get().is_some(),
         STRING_LITERALS.get().is_some(),
@@ -128,7 +131,8 @@ fn dump_inner(progress: &Progress) -> Result<()> {
 
     let mut out = ScriptJson::default();
     let mut methods = HashMap::new();
-    dump_methods(&mut out, &mut methods, progress)?;
+    let mut shared_method_rvas = HashSet::new();
+    dump_methods(&mut out, &mut methods, &mut shared_method_rvas, progress)?;
 
     progress.stage("locate metadata tables", 0);
     let (metadata_init_rva, table_va, offsets) =
@@ -307,12 +311,20 @@ fn dump_inner(progress: &Progress) -> Result<()> {
         out.script_metadata_method.len(),
         out.script_string.len()
     );
+    log::info!(
+        "[Script Dumper] method RVA ownership: unique_rvas={} shared_rvas={}",
+        methods.len().saturating_sub(shared_method_rvas.len()),
+        shared_method_rvas.len()
+    );
 
     // The IPC task gate serializes dumpers. Publish only after every stage and
     // output write succeeds, so a retry cannot reuse a half-complete cache.
     METHODS
         .set(methods)
         .map_err(|_| anyhow::anyhow!("METHODS already published"))?;
+    METHODS_SHARED_RVAS
+        .set(shared_method_rvas)
+        .map_err(|_| anyhow::anyhow!("METHODS_SHARED_RVAS already published"))?;
     TYPE_INFOS
         .set(type_infos)
         .map_err(|_| anyhow::anyhow!("TYPE_INFOS already published"))?;
@@ -343,7 +355,30 @@ fn guarded<T>(mut work: impl FnMut() -> Result<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::observe_method_rva;
     use super::{BTreeSet, Progress, guarded, visit_table};
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn duplicate_same_handle_does_not_mark_shared_rva() {
+        let mut first = HashMap::new();
+        let mut shared = HashSet::new();
+        observe_method_rva(&mut first, &mut shared, 0x1234, 0x1000);
+        observe_method_rva(&mut first, &mut shared, 0x1234, 0x1000);
+        assert_eq!(first.get(&0x1234), Some(&0x1000));
+        assert!(shared.is_empty());
+    }
+
+    #[test]
+    fn different_handles_mark_shared_rva_stickily() {
+        let mut first = HashMap::new();
+        let mut shared = HashSet::new();
+        observe_method_rva(&mut first, &mut shared, 0x1234, 0x1000);
+        observe_method_rva(&mut first, &mut shared, 0x1234, 0x2000);
+        observe_method_rva(&mut first, &mut shared, 0x1234, 0x1000);
+        assert_eq!(first.get(&0x1234), Some(&0x1000));
+        assert!(shared.contains(&0x1234));
+    }
 
     #[test]
     fn script_errors_and_panics_return_through_native_boundary() {
@@ -492,27 +527,32 @@ fn visit_table(
 fn dump_methods(
     out: &mut ScriptJson,
     methods: &mut HashMap<u64, Il2CppMethod>,
+    shared_method_rvas: &mut HashSet<u64>,
     progress: &Progress,
 ) -> Result<()> {
     let count = unsafe { MAX_TYPEDEFINDEX };
     progress.stage("method definitions", count as usize);
     let mut method_idx = 0;
+    let mut first_handles = HashMap::new();
     for typedef_index in 0..count {
         progress.step(typedef_index as usize, 0, "enumerate class methods");
         guarded(|| {
             let class = il2cpp::vm::metadata_cache::get_typeinfo_from_typedefindex(typedef_index);
             let name = class.byval_arg().get_name(Il2CppTypeNameFormat::IL);
             for method in class.get_methods() {
+                let native_rva = method.rva();
+                let rva = native_rva as u64;
+                observe_method_rva(&mut first_handles, shared_method_rvas, rva, method.0);
                 out.script_method.insert(
                     method_idx,
                     ScriptMethod {
-                        address: method.rva(),
+                        address: native_rva,
                         name: format!("{}$${}", name, method.get_name()),
                         signature: String::new(),
                         type_signature: String::new(),
                     },
                 );
-                methods.insert(method.rva() as u64, method);
+                methods.insert(rva, method);
                 method_idx += 1;
             }
             Ok(())
@@ -521,6 +561,21 @@ fn dump_methods(
     }
     log::info!("[Script Dumper] method definitions={method_idx}");
     Ok(())
+}
+
+fn observe_method_rva(
+    first_handles: &mut HashMap<u64, usize>,
+    shared_rvas: &mut HashSet<u64>,
+    rva: u64,
+    raw_handle: usize,
+) {
+    if let Some(first) = first_handles.get(&rva) {
+        if *first != raw_handle {
+            shared_rvas.insert(rva);
+        }
+    } else {
+        first_handles.insert(rva, raw_handle);
+    }
 }
 
 fn scan_address() -> Option<(usize, usize, HashMap<usize, usize>)> {

@@ -9,6 +9,9 @@ use std::{collections::BTreeMap, collections::BTreeSet, fs, path::PathBuf, time:
 type Key = (usize, String, String);
 type Pair = (u32, u32);
 
+#[path = "native_flow_setter_replay.rs"]
+mod setter_calls;
+
 #[derive(Deserialize)]
 struct Input {
     image_size: usize,
@@ -28,6 +31,8 @@ struct Method {
     next_metadata_entry: usize,
     #[serde(default = "default_scalar_bytes")]
     scalar_bytes: usize,
+    #[serde(default)]
+    proto_parameter_index: usize,
 }
 fn default_scalar_bytes() -> usize {
     4
@@ -78,9 +83,17 @@ fn scan_json(scan: &ScanResult) -> Value {
         "copies": scan.copies.iter().map(|c| json!({
             "proto_offset": c.proto_offset, "business_offset": c.business_offset,
             "load_rva": c.load_rva, "store_rva": c.store_rva,
+            "setter_call": c.setter_call,
         })).collect::<Vec<_>>(),
+        "call_arguments": scan.call_arguments.iter().map(|a| json!({
+            "call_rva": a.call_rva, "target_rva": a.target_rva,
+            "argument_index": a.argument_index, "receiver_is_business": a.receiver_is_business,
+            "proto_offset": a.proto_offset, "load_rva": a.load_rva,
+        })).collect::<Vec<_>>(),
+        "witnessed_call_arguments": scan.witnessed_call_arguments,
         "accessor_offset": scan.accessor_offset, "accessor_sites": scan.accessor_sites,
         "decoded": scan.decoded, "rejected_paths": scan.rejected_paths,
+        "rejected_sites": scan.rejected_sites,
         "ambiguous": scan.ambiguous,
     })
 }
@@ -224,7 +237,8 @@ fn replay_candidate_native_methods() -> Result<()> {
             "duplicate native identity"
         );
         let mut row = json!({"owner":method.owner,"signature":method.signature,"rva":method.rva,
-            "mode":method.mode,"body_bytes":method.body_bytes,"body_end":method.body_end,"scalar_bytes":method.scalar_bytes});
+            "mode":method.mode,"body_bytes":method.body_bytes,"body_end":method.body_end,"scalar_bytes":method.scalar_bytes,
+            "proto_parameter_index":method.proto_parameter_index});
         let result = (|| -> Result<()> {
             let mode = match method.mode.as_str() {
                 "Sync" => Mode::Sync,
@@ -233,13 +247,23 @@ fn replay_candidate_native_methods() -> Result<()> {
                 _ => anyhow::bail!("unsupported candidate scan mode"),
             };
             let bytes = validate_method(&resolver.pe, method)?;
-            let before = sync_scan::scan_typed(&bytes, method.rva, mode, method.scalar_bytes);
+            let before = sync_scan::scan_planned_parameter_typed(
+                &bytes,
+                method.rva,
+                mode,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                None,
+                method.scalar_bytes,
+                method.proto_parameter_index,
+            );
             row["ordinary_scan"] = scan_json(&before);
             let mut after = None;
             if mode == Mode::Sync {
                 match resolver.plan(method.rva, &bytes) {
                     Ok(plan) => {
-                        after = Some(sync_scan::scan_planned_typed(
+                        after = Some(sync_scan::scan_planned_parameter_typed(
                             &bytes,
                             method.rva,
                             mode,
@@ -248,6 +272,7 @@ fn replay_candidate_native_methods() -> Result<()> {
                             &plan.switch_edges,
                             plan.code_bytes,
                             method.scalar_bytes,
+                            method.proto_parameter_index,
                         ));
                         row["plan"] = serde_json::to_value(plan)?;
                     }
@@ -274,7 +299,7 @@ fn replay_candidate_native_methods() -> Result<()> {
     let report = json!({"validation":if failures == 0 {"success"} else {"failed"},
         "input":input_path,"source_dll":dll_path,"binding":"declared-disk-only","methods":rows,
         "statistics":resolver.stats,"failures":failures,"total_ms":total.elapsed().as_secs_f64()*1000.0,
-        "boundary":"Complete current disk bodies bounded by captured PE/metadata; scanner assumes instance RCX=this/RDX=Proto. Method instance, actual return ABI and declared typed property require runtime verification before any naming acceptance."});
+        "boundary":"Complete current disk bodies bounded by captured PE/metadata; scanner assumes instance RCX=this and the fixture's explicit Proto managed ordinal 0/1/2 in RDX/R8/R9. Method instance, actual return ABI, parameter identity and declared typed property require runtime verification before any naming acceptance."});
     fs::create_dir_all(&output)?;
     fs::write(
         output.join("candidate-native-output.json"),

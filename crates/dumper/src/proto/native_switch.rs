@@ -16,9 +16,9 @@ pub(super) struct Decoded {
 struct Switch {
     table_start: usize,
     table_end: usize,
-    prep_start: usize,
     protected: Range<usize>,
     jump_ip: usize,
+    default_target: usize,
     targets: Vec<usize>,
 }
 
@@ -82,12 +82,20 @@ fn ordinary(instruction: &Instruction) -> bool {
 }
 
 fn index_seed(instruction: &Instruction, index: Register) -> bool {
-    if instruction.mnemonic() != Mnemonic::Mov
-        || instruction.op_count() != 2
+    if instruction.op_count() != 2
         || instruction.op0_kind() != OpKind::Register
         || instruction.op0_register() != index
         || !ordinary(instruction)
     {
+        return false;
+    }
+    if instruction.mnemonic() == Mnemonic::Lea {
+        return instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_base() != Register::RIP
+            && gpr(instruction.memory_base(), 8)
+            && instruction.memory_index() == Register::None;
+    }
+    if instruction.mnemonic() != Mnemonic::Mov {
         return false;
     }
     match instruction.op1_kind() {
@@ -213,8 +221,26 @@ fn analyze_switch(
     else {
         return Ok(None);
     };
-    let Some(branch_index) = jump_index.checked_sub(4) else {
-        anyhow::bail!("switch dispatch has no guard branch");
+    let lea_index = jump_index.checked_sub(3).context("switch LEA underflow")?;
+    let copy_guard_index = lea_index.checked_sub(1).filter(|index| {
+        let instruction = &instructions[*index];
+        instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op_count() == 2
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && gpr(instruction.op0_register(), 4)
+            && gpr(instruction.op1_register(), 4)
+            && instruction.op0_register().full_register() == index64
+            && ordinary(instruction)
+    });
+    let branch_index = if copy_guard_index.is_some() {
+        copy_guard_index
+            .and_then(|index| index.checked_sub(1))
+            .context("switch dispatch has no guard branch")?
+    } else {
+        lea_index
+            .checked_sub(1)
+            .context("switch dispatch has no guard branch")?
     };
     let Some(cmp_index) = branch_index.checked_sub(1) else {
         anyhow::bail!("switch dispatch has no compare");
@@ -233,10 +259,29 @@ fn analyze_switch(
             && cmp.op_count() == 2
             && cmp.op0_kind() == OpKind::Register
             && gpr(cmp.op0_register(), 4)
-            && cmp.op0_register().full_register() == index64
             && ordinary(cmp),
-        "switch bounds compare does not use the prepared index"
+        "switch bounds compare has no 32-bit index"
     );
+    let compare_index = cmp.op0_register();
+    if let Some(copy_index) = copy_guard_index {
+        let copy = &instructions[copy_index];
+        ensure!(
+            copy.op1_register() == compare_index,
+            "switch guard copy source differs from compared register"
+        );
+        for instruction in &instructions[cmp_index + 2..copy_index] {
+            ensure!(
+                !writes_register(instruction, compare_index),
+                "switch compare source changes before its guarded copy"
+            );
+        }
+    } else {
+        ensure!(
+            compare_index.full_register() == index64,
+            "switch bounds compare does not use the prepared index"
+        );
+        let _ = find_prep(instructions, cmp_index, compare_index)?;
+    }
     let immediate =
         immediate_nonnegative(cmp).context("switch bound is not nonnegative immediate")?;
     let count = match branch.mnemonic() {
@@ -252,8 +297,8 @@ fn analyze_switch(
     ensure!(
         table_start >= rva
             && table_start >= address(instructions[jump_index].next_ip(), "switch JMP next IP")?
-            && table_end == body_end,
-        "switch table is not the unique function-tail table"
+            && table_end <= body_end,
+        "switch table is outside function bytes"
     );
     let table_offset = table_start
         .checked_sub(rva)
@@ -263,38 +308,7 @@ fn analyze_switch(
         "truncated switch table"
     );
 
-    let mut prefix = Vec::new();
-    let mut decoder = Decoder::with_ip(64, &code[..table_offset], rva as u64, DecoderOptions::NONE);
-    while decoder.can_decode() {
-        let instruction = decoder.decode();
-        ensure!(
-            !instruction.is_invalid(),
-            "invalid switch code prefix at 0x{:X}",
-            instruction.ip()
-        );
-        prefix.push(instruction);
-    }
-    ensure!(
-        address(decoder.ip(), "decoded code end")? == table_start,
-        "switch prefix does not end at table"
-    );
-    let jump_ip = address(instructions[jump_index].ip(), "switch JMP IP")?;
-    let prefix_positions: BTreeMap<_, _> = prefix
-        .iter()
-        .enumerate()
-        .map(|(index, instruction)| (instruction.ip() as usize, index))
-        .collect();
-    let target_set: std::collections::BTreeSet<_> = prefix_positions.keys().copied().collect();
-    let prep_start = find_prep(&prefix, cmp_index, cmp.op0_register())?;
-    let guard_end = address(instructions[jump_index].next_ip(), "switch JMP end")?;
-    let prep_end = guard_end;
     let default_target = near_target(branch).context("switch guard has no direct target")?;
-    ensure!(
-        target_set.contains(&default_target)
-            && (default_target < prep_start || default_target >= prep_end),
-        "switch guard target is not a code-prefix instruction outside its dispatch"
-    );
-
     let mut targets = Vec::with_capacity(count);
     for index in 0..count {
         let item_rva = table_start
@@ -310,12 +324,8 @@ fn analyze_switch(
         );
         let target = add_signed(table_start, i64::from(displacement), "switch target")?;
         ensure!(
-            target >= rva && target < table_start && target_set.contains(&target),
-            "switch target is outside code prefix or inside an instruction"
-        );
-        ensure!(
-            target < prep_start || target >= prep_end,
-            "switch case targets its own dispatch guard"
+            target >= rva && target < table_start,
+            "switch target is outside code prefix"
         );
         targets.push(target);
     }
@@ -331,11 +341,19 @@ fn analyze_switch(
     Ok(Some(Switch {
         table_start,
         table_end,
-        prep_start,
-        protected: prep_start..guard_end,
-        jump_ip,
+        protected: address(instructions[cmp_index].ip(), "switch CMP IP")?
+            ..address(instructions[jump_index].next_ip(), "switch JMP end")?,
+        jump_ip: address(instructions[jump_index].ip(), "switch JMP IP")?,
+        default_target,
         targets,
     }))
+}
+
+fn writes_register(instruction: &Instruction, register: Register) -> bool {
+    if instruction.op_count() == 0 || instruction.op0_kind() != OpKind::Register {
+        return false;
+    }
+    instruction.op0_register().full_register() == register.full_register()
 }
 
 fn find_prep(instructions: &[Instruction], cmp_index: usize, index: Register) -> Result<usize> {
@@ -407,84 +425,152 @@ pub(super) fn decode(code: &[u8], rva: usize) -> Result<Decoded> {
         });
     }
 
-    // Prefer the earliest fully proven table. A later dispatch-shaped byte
-    // sequence may be an accidental decode of that table's data; it cannot
-    // mask the earlier code/table boundary.
-    switches.sort_by_key(|switch| switch.table_start);
-    let first = &switches[0];
-    if let Some(invalid) = invalid_ip {
-        ensure!(
-            invalid >= first.table_start && invalid < first.table_end,
-            "invalid instruction precedes the proven switch table"
-        );
-    }
-    let code_bytes = first
-        .table_start
-        .checked_sub(rva)
-        .context("switch table precedes function")?;
-    let mut prefix = Vec::new();
-    let mut decoder = Decoder::with_ip(64, &code[..code_bytes], rva as u64, DecoderOptions::NONE);
-    while decoder.can_decode() {
-        let instruction = decoder.decode();
-        ensure!(
-            !instruction.is_invalid(),
-            "invalid native code before switch table at 0x{:X}",
-            instruction.ip()
-        );
-        prefix.push(instruction);
-    }
-    ensure!(
-        address(decoder.ip(), "switch prefix end")? == first.table_start,
-        "switch table does not follow a complete instruction prefix"
-    );
-
-    let prefix_starts: std::collections::BTreeSet<_> = prefix
+    // A compiler can emit several guarded tables in one contiguous function
+    // tail. Enumerate complete, nonoverlapping tail chains first so tables do
+    // not get decoded as a second function prefix.
+    let mut ranges: Vec<_> = switches
         .iter()
-        .map(|instruction| instruction.ip() as usize)
+        .map(|switch| (switch.table_start, switch.table_end))
         .collect();
-    switches.retain(|switch| prefix_starts.contains(&switch.jump_ip));
-    ensure!(
-        !switches.is_empty(),
-        "switch dispatch is outside code prefix"
-    );
-    let first = &switches[0];
-    ensure!(
-        switches.iter().all(|switch| {
-            switch.table_start == first.table_start && switch.table_end == first.table_end
-        }),
-        "multiple distinct tail switch tables"
-    );
+    ranges.sort_unstable();
+    ranges.dedup();
+    let mut chains = Vec::new();
+    for &(start, end) in ranges.iter().filter(|(_, end)| *end == body_end) {
+        let mut chain = vec![(start, end)];
+        let mut cursor = start;
+        while let Some(&(prior_start, prior_end)) =
+            ranges.iter().find(|(_, prior_end)| *prior_end == cursor)
+        {
+            if prior_end <= prior_start {
+                break;
+            }
+            chain.push((prior_start, prior_end));
+            cursor = prior_start;
+        }
+        chain.sort_unstable();
+        if chain.windows(2).all(|window| window[0].1 == window[1].0) {
+            chains.push(chain);
+        }
+    }
+    chains.sort();
+    chains.dedup();
 
-    let recognized_jumps: std::collections::BTreeSet<_> =
-        switches.iter().map(|switch| switch.jump_ip).collect();
-    for instruction in &prefix {
-        if matches!(
-            instruction.flow_control(),
-            FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
-        ) {
-            if let Some(target) = near_target(instruction) {
-                for switch in &switches {
-                    if target >= switch.prep_start && target < switch.protected.end {
-                        ensure!(
-                            target == switch.prep_start,
-                            "direct branch enters switch dispatch guard"
-                        );
+    let mut valid = Vec::new();
+    for chain in chains {
+        let prefix_end = chain[0].0;
+        let selected: Vec<_> = switches
+            .iter()
+            .filter(|switch| {
+                chain.contains(&(switch.table_start, switch.table_end))
+                    && switch.jump_ip < prefix_end
+            })
+            .cloned()
+            .collect();
+        if selected.is_empty()
+            || chain.iter().any(|range| {
+                !selected
+                    .iter()
+                    .any(|switch| (switch.table_start, switch.table_end) == *range)
+            })
+        {
+            continue;
+        }
+        let code_bytes = match prefix_end.checked_sub(rva) {
+            Some(value) if value <= code.len() => value,
+            _ => continue,
+        };
+        let mut prefix = Vec::new();
+        let mut decoder =
+            Decoder::with_ip(64, &code[..code_bytes], rva as u64, DecoderOptions::NONE);
+        let mut decode_failed = false;
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            if instruction.is_invalid() {
+                decode_failed = true;
+                break;
+            }
+            prefix.push(instruction);
+        }
+        if decode_failed || address(decoder.ip(), "switch prefix end").ok() != Some(prefix_end) {
+            continue;
+        }
+        if invalid_ip.is_some_and(|invalid| invalid < prefix_end) {
+            continue;
+        }
+        let starts: std::collections::BTreeSet<_> = prefix
+            .iter()
+            .map(|instruction| instruction.ip() as usize)
+            .collect();
+        if selected.iter().any(|switch| {
+            !starts.contains(&switch.jump_ip)
+                || !starts.contains(&switch.default_target)
+                || switch.targets.iter().any(|target| !starts.contains(target))
+        }) {
+            continue;
+        }
+        let mut selected = selected;
+        selected.sort_by_key(|switch| (switch.protected.start, switch.protected.end));
+        if selected
+            .windows(2)
+            .any(|pair| pair[0].protected.end > pair[1].protected.start)
+        {
+            continue;
+        }
+        let targets = selected.iter().flat_map(|switch| {
+            switch
+                .targets
+                .iter()
+                .copied()
+                .chain([switch.default_target])
+        });
+        if targets.into_iter().any(|target| {
+            selected
+                .iter()
+                .any(|switch| target >= switch.protected.start && target < switch.protected.end)
+        }) {
+            continue;
+        }
+        let recognized_jumps: std::collections::BTreeSet<_> =
+            selected.iter().map(|switch| switch.jump_ip).collect();
+        let mut rejected = false;
+        for instruction in &prefix {
+            if matches!(
+                instruction.flow_control(),
+                FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
+            ) {
+                if let Some(target) = near_target(instruction) {
+                    if selected.iter().any(|switch| {
+                        target >= switch.protected.start && target < switch.protected.end
+                    }) || chain
+                        .iter()
+                        .any(|(start, end)| target >= *start && target < *end)
+                    {
+                        rejected = true;
+                        break;
                     }
                 }
-                ensure!(
-                    target < first.table_start || target >= body_end,
-                    "direct branch targets switch table data"
-                );
+            }
+            if instruction.flow_control() == FlowControl::IndirectBranch
+                && !recognized_jumps.contains(&(instruction.ip() as usize))
+            {
+                rejected = true;
+                break;
             }
         }
-        if instruction.flow_control() == FlowControl::IndirectBranch {
-            ensure!(
-                recognized_jumps.contains(&address(instruction.ip(), "indirect branch IP")?),
-                "unrecognized indirect branch in guarded-switch function"
-            );
+        if rejected {
+            continue;
         }
+        valid.push((prefix, code_bytes, selected));
     }
-
+    ensure!(
+        valid.len() == 1,
+        if valid.is_empty() {
+            "no complete guarded switch-table chain covers the function tail"
+        } else {
+            "ambiguous guarded switch-table tail chains"
+        }
+    );
+    let (prefix, code_bytes, switches) = valid.pop().unwrap();
     let mut switch_edges = BTreeMap::new();
     let mut protected_ranges = Vec::new();
     for switch in switches {
@@ -619,7 +705,7 @@ mod tests {
             assert_eq!(targets, &[sample.case0, sample.case1]);
             assert_eq!(
                 decoded.protected_ranges,
-                [sample.rva..sample.guard_entry + 22]
+                [sample.cmp..sample.guard_entry + 22]
             );
         }
         Ok(())
@@ -632,7 +718,7 @@ mod tests {
         let decoded = decode(&sample.code, sample.rva)?;
         assert_eq!(
             decoded.protected_ranges,
-            [sample.rva + 5..sample.guard_entry + 22]
+            [sample.cmp..sample.guard_entry + 22]
         );
         Ok(())
     }
@@ -710,5 +796,149 @@ mod tests {
     fn checked_address_arithmetic_rejects_overflow() {
         let sample = sample(Some(0x87), 1, &[0x8b, 0x01]);
         assert!(decode(&sample.code, usize::MAX - sample.code.len() + 1).is_err());
+    }
+
+    fn two_switches(gap: usize, first_bound: u8, second_bound: u8, shared_table: bool) -> Vec<u8> {
+        let rva = 0x3000usize;
+        let mut code = Vec::new();
+        let mut guards = Vec::new();
+        let mut leas = Vec::new();
+        for (bound, table_index) in [(first_bound, 0usize), (second_bound, 1usize)] {
+            code.extend([0xb8, 0, 0, 0, 0]); // MOV EAX,0: a 32-bit seed.
+            code.extend([0x83, 0xf8, bound]); // CMP EAX,bound.
+            let guard = rva + code.len();
+            code.extend([0x0f, 0x87, 0, 0, 0, 0]); // JA default.
+            guards.push(guard);
+            let lea = rva + code.len();
+            code.extend([0x48, 0x8d, 0x0d, 0, 0, 0, 0]); // LEA RCX,[table].
+            leas.push((lea, table_index));
+            code.extend([0x48, 0x63, 0x04, 0x81]);
+            code.extend([0x48, 0x01, 0xc8]);
+            code.extend([0xff, 0xe0]);
+        }
+        let case0 = rva + code.len();
+        code.extend([0x90, 0xc3]);
+        let case1 = rva + code.len();
+        code.extend([0x90, 0xc3]);
+        let default0 = rva + code.len();
+        code.push(0xc3);
+        let default1 = rva + code.len();
+        code.push(0xc3);
+        let table1 = rva + code.len();
+        let first_count = usize::from(first_bound) + 1;
+        let second_count = usize::from(second_bound) + 1;
+        let table2 = if shared_table {
+            table1
+        } else {
+            table1 + first_count * 4 + gap
+        };
+        for (index, target) in [default0, default1].into_iter().enumerate() {
+            let branch = guards[index];
+            code[branch + 2 - rva..branch + 6 - rva]
+                .copy_from_slice(&((target as i64 - (branch as i64 + 6)) as i32).to_le_bytes());
+        }
+        for (lea, table_index) in leas {
+            let table = if shared_table || table_index == 0 {
+                table1
+            } else {
+                table2
+            };
+            code[lea + 3 - rva..lea + 7 - rva]
+                .copy_from_slice(&((table as i64 - (lea as i64 + 7)) as i32).to_le_bytes());
+        }
+        let first_table_count = if shared_table {
+            first_count.max(second_count)
+        } else {
+            first_count
+        };
+        for index in 0..first_table_count {
+            let target = if index % 2 == 0 { case0 } else { case1 };
+            code.extend(((target as i64 - table1 as i64) as i32).to_le_bytes());
+        }
+        if !shared_table {
+            code.resize(code.len() + gap, 0x90);
+            for index in 0..second_count {
+                let target = if index % 2 == 0 { case0 } else { case1 };
+                code.extend(((target as i64 - table2 as i64) as i32).to_le_bytes());
+            }
+        }
+        code
+    }
+
+    fn guard_copy_sample(copy_source: u8) -> Vec<u8> {
+        let rva = 0x4000usize;
+        let mut code = vec![0x83, 0xfe, 0x01]; // CMP ESI,1.
+        let branch = rva + code.len();
+        code.extend([0x0f, 0x87, 0, 0, 0, 0]); // JA default.
+        code.extend([0x89, 0xc0 | (copy_source << 3)]); // MOV EAX,ESI or EDX.
+        let lea = rva + code.len();
+        code.extend([0x48, 0x8d, 0x0d, 0, 0, 0, 0]);
+        code.extend([0x48, 0x63, 0x04, 0x81]);
+        code.extend([0x48, 0x01, 0xc8]);
+        code.extend([0xff, 0xe0]);
+        let case0 = rva + code.len();
+        code.extend([0x90, 0xc3]);
+        let case1 = rva + code.len();
+        code.extend([0x90, 0xc3]);
+        let default = rva + code.len();
+        code.push(0xc3);
+        let table = rva + code.len();
+        code[branch + 2 - rva..branch + 6 - rva]
+            .copy_from_slice(&((default as i64 - (branch as i64 + 6)) as i32).to_le_bytes());
+        code[lea + 3 - rva..lea + 7 - rva]
+            .copy_from_slice(&((table as i64 - (lea as i64 + 7)) as i32).to_le_bytes());
+        for target in [case0, case1] {
+            code.extend(((target as i64 - table as i64) as i32).to_le_bytes());
+        }
+        code
+    }
+
+    #[test]
+    fn accepts_guarded_lea32_index_and_post_guard_copy() -> Result<()> {
+        let lea_index = sample(Some(0x87), 1, &[0x8d, 0x41, 0xfe]);
+        assert_eq!(
+            decode(&lea_index.code, lea_index.rva)?.switch_edges.len(),
+            1
+        );
+
+        let copied = guard_copy_sample(6); // ESI -> EAX.
+        let decoded = decode(&copied, 0x4000)?;
+        assert_eq!(decoded.switch_edges.len(), 1);
+        assert_eq!(decoded.protected_ranges.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_adjacent_guarded_tables_as_a_complete_tail() -> Result<()> {
+        let code = two_switches(0, 1, 1, false);
+        let decoded = decode(&code, 0x3000)?;
+        assert_eq!(decoded.switch_edges.len(), 2);
+        assert_eq!(decoded.code_bytes, code.len() - 16);
+        assert_eq!(decoded.protected_ranges.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_noncontiguous_or_overlapping_tail_tables_and_extra_tail_bytes() {
+        assert!(decode(&two_switches(1, 1, 1, false), 0x3000).is_err());
+        assert!(decode(&two_switches(0, 1, 2, true), 0x3000).is_err());
+        let mut extra = sample(Some(0x87), 1, &[0x8b, 0x01]).code;
+        extra.push(0x90);
+        assert!(decode(&extra, 0x1000).is_err());
+
+        let mut enters_other_guard = two_switches(0, 1, 1, false);
+        let first_table = 0x3000 + enters_other_guard.len() - 16;
+        let second_cmp = 0x3000 + 30 + 5;
+        let at = first_table - 0x3000;
+        enters_other_guard[at..at + 4]
+            .copy_from_slice(&((second_cmp as i64 - first_table as i64) as i32).to_le_bytes());
+        assert!(decode(&enters_other_guard, 0x3000).is_err());
+    }
+
+    #[test]
+    fn rejects_guard_copy_from_wrong_register_and_lea64_seed() {
+        assert!(decode(&guard_copy_sample(2), 0x4000).is_err()); // EDX != CMP source ESI.
+        let invalid_lea = sample(Some(0x87), 1, &[0x48, 0x8d, 0x41, 0xfe]).code;
+        assert!(decode(&invalid_lea, 0x1000).is_err());
     }
 }

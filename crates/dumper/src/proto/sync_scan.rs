@@ -21,29 +21,148 @@ pub(super) struct CopyEvidence {
     // agree on the source offset; choosing a site never chooses a field.
     pub load_rva: usize,
     pub store_rva: usize,
+    pub setter_call: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct CallArgument {
+    pub call_rva: usize,
+    pub target_rva: usize,
+    /// Windows AMD64 register slot, including the instance receiver.
+    pub argument_index: usize,
+    pub receiver_is_business: bool,
+    pub proto_offset: u32,
+    pub load_rva: usize,
+}
+
+/// Native sites independently bound to the current runtime by the caller.
+/// These maps prove only load provenance; the caller must verify the live Class
+/// identity, actual allocator target, static method ABI and literal table slots.
+#[derive(Debug, Default)]
+pub(super) struct FactoryContext {
+    pub allocator_rva: usize,
+    pub owner_class_loads: BTreeMap<usize, usize>,
+    pub literal_loads: BTreeMap<usize, usize>,
+}
+
+/// A literal and Proto value reaching one direct call, with no naming claim.
+/// The caller must separately bind the actual callee and its key/value ABI.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct LiteralKeyCall {
+    pub call_rva: usize,
+    pub target_rva: usize,
+    pub proto_offset: u32,
+    pub load_rva: usize,
+    pub literal_slot_rva: usize,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct ScanResult {
     pub copies: Vec<CopyEvidence>,
+    pub call_arguments: Vec<CallArgument>,
+    pub witnessed_call_arguments: usize,
+    pub literal_key_calls: Vec<LiteralKeyCall>,
     pub accessor_offset: Option<u32>,
     // Return sites for a getter, direct write sites for a setter.
     pub accessor_sites: Vec<usize>,
     pub decoded: usize,
     pub rejected_paths: usize,
+    pub rejected_sites: Vec<usize>,
     pub ambiguous: bool,
+    destination_writes: Vec<BusinessWrite>,
+    business_calls: Vec<BusinessCall>,
+}
+
+#[derive(Debug)]
+struct BusinessCall {
+    target_rva: usize,
+    source: Option<WriteSource>,
+}
+
+impl ScanResult {
+    /// Bind only an actual owned, typed property setter supplied by metadata.
+    /// Reuse the caller's complete native writer and destination conflict gates.
+    pub(super) fn bind_setter_calls(
+        &mut self,
+        bytes: usize,
+        mut setter_offset: impl FnMut(usize) -> Option<(u32, usize)>,
+    ) {
+        let setter_writes: Vec<_> = self
+            .business_calls
+            .iter()
+            .filter_map(|call| {
+                let (offset, width) = setter_offset(call.target_rva)?;
+                Some(BusinessWrite {
+                    start: i64::from(offset),
+                    end: Some(i64::from(offset) + i64::try_from(width).ok()?),
+                    source: (width == bytes).then_some(call.source).flatten(),
+                })
+            })
+            .collect();
+        let before = self.copies.len();
+        self.copies.retain(|copy| {
+            !setter_writes.iter().any(|write| {
+                write.rejects(
+                    copy.business_offset,
+                    WriteSource::ProtoField(copy.proto_offset),
+                    bytes,
+                )
+            })
+        });
+        self.ambiguous |= before != self.copies.len();
+        for argument in &self.call_arguments {
+            if !argument.receiver_is_business || argument.argument_index != 1 {
+                continue;
+            }
+            let Some((offset, width)) = setter_offset(argument.target_rva) else {
+                continue;
+            };
+            if width != bytes
+                || self
+                    .destination_writes
+                    .iter()
+                    .chain(&setter_writes)
+                    .any(|write| {
+                        write.rejects(
+                            offset,
+                            WriteSource::ProtoField(argument.proto_offset),
+                            bytes,
+                        )
+                    })
+            {
+                continue;
+            }
+            self.copies.push(CopyEvidence {
+                proto_offset: argument.proto_offset,
+                business_offset: offset,
+                load_rva: argument.load_rva,
+                store_rva: argument.call_rva,
+                setter_call: true,
+            });
+        }
+        remove_copy_conflicts(self);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Value {
     BusinessPtr,
     ProtoPtr,
+    OwnerClass,
+    LiteralSlot(usize),
     ProtoField { offset: u32, loads: BTreeSet<usize> },
     BusinessField(u32),
     SetterValue,
     Vector([Option<Lane>; 4]),
 }
 type State = BTreeMap<Register, Value>;
+
+fn pointer_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::BusinessPtr | Value::ProtoPtr | Value::OwnerClass | Value::LiteralSlot(_)
+    )
+}
 
 // A SIMD register contains four separate 32-bit lanes. Missing lanes include
 // zeroed bits: those bits are not evidence for another wire field.
@@ -77,12 +196,13 @@ fn join_lane(current: &mut Option<Lane>, incoming: &Option<Lane>) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WriteSource {
     ProtoField(u32),
     SetterValue,
 }
 
+#[derive(Debug)]
 struct BusinessWrite {
     start: i64,
     end: Option<i64>,
@@ -245,7 +365,10 @@ fn operand(instruction: &Instruction, index: u32, state: &State, bytes: usize) -
             let value = state.get(&register.full_register())?;
             let width = register.size();
             let valid = match value {
-                Value::BusinessPtr | Value::ProtoPtr => width == 8,
+                Value::BusinessPtr
+                | Value::ProtoPtr
+                | Value::OwnerClass
+                | Value::LiteralSlot(_) => width == 8,
                 _ => match bytes {
                     1 => {
                         matches!(width, 1 | 4 | 8)
@@ -356,11 +479,27 @@ fn transfer(
     state: &State,
     factory: &mut InstructionInfoFactory,
     bytes: usize,
+    context: Option<&FactoryContext>,
 ) -> State {
     // Evaluate the source while a destination register still holds its old
     // pointer, notably mov edi,[rdi+offset]. Arithmetic and conditional moves
     // intentionally produce no symbolic value.
-    let assigned = if (instruction.mnemonic() == Mnemonic::Mov
+    let site = instruction.ip() as usize;
+    let contextual_load = context.and_then(|context| {
+        if context.owner_class_loads.contains_key(&site) {
+            Some(Value::OwnerClass)
+        } else {
+            context
+                .literal_loads
+                .get(&site)
+                .copied()
+                .map(Value::LiteralSlot)
+        }
+    });
+    let assigned = if contextual_load.is_some() {
+        // Every supplied site was validated against the actual MOV8 below.
+        contextual_load
+    } else if (instruction.mnemonic() == Mnemonic::Mov
         || (bytes == 1 && instruction.mnemonic() == Mnemonic::Movzx))
         && instruction.op_count() == 2
         && instruction.op0_kind() == OpKind::Register
@@ -375,11 +514,10 @@ fn transfer(
             4 => matches!(instruction.op0_register().size(), 4 | 8),
             8 => instruction.op0_register().size() == 8,
             _ => false,
-        } {
-        operand(instruction, 1, state, bytes).filter(|value| {
-            !matches!(value, Value::BusinessPtr | Value::ProtoPtr)
-                || instruction.op0_register().size() == 8
-        })
+        }
+    {
+        operand(instruction, 1, state, bytes)
+            .filter(|value| !pointer_value(value) || instruction.op0_register().size() == 8)
     } else if bytes == 4 {
         vector_assignment(instruction, state)
     } else {
@@ -460,7 +598,11 @@ fn successors(
     terminal_calls: &BTreeSet<usize>,
     exceptional_edges: &BTreeMap<usize, Vec<usize>>,
     switch_edges: &BTreeMap<usize, Vec<usize>>,
+    tail_exits: &BTreeSet<usize>,
 ) -> (Vec<usize>, usize) {
+    if tail_exits.contains(&(instruction.ip() as usize)) {
+        return (Vec::new(), 0);
+    }
     let mut next = Vec::with_capacity(2);
     let mut rejected = 0;
     let flow = instruction.flow_control();
@@ -549,6 +691,7 @@ fn remove_copy_conflicts(result: &mut ScanResult) {
     result.ambiguous |= count != result.copies.len();
 }
 
+#[cfg(test)]
 pub(super) fn scan(code: &[u8], rva: usize, mode: Mode) -> ScanResult {
     scan_controlled(code, rva, mode, &BTreeSet::new(), &BTreeMap::new())
 }
@@ -557,6 +700,7 @@ pub(super) fn scan_typed(code: &[u8], rva: usize, mode: Mode, bytes: usize) -> S
     scan_controlled_typed(code, rva, mode, &BTreeSet::new(), &BTreeMap::new(), bytes)
 }
 
+#[cfg(test)]
 pub(super) fn scan_controlled(
     code: &[u8],
     rva: usize,
@@ -597,7 +741,162 @@ pub(super) fn scan_planned_typed(
     code_bytes: Option<usize>,
     bytes: usize,
 ) -> ScanResult {
+    scan_planned_parameter_typed(
+        code,
+        rva,
+        mode,
+        terminal_calls,
+        exceptional_edges,
+        switch_edges,
+        code_bytes,
+        bytes,
+        0,
+    )
+}
+
+/// The caller must bind the actual managed Proto parameter and independently
+/// exclude hidden return buffers. Instance parameter 0/1/2 occupies RDX/R8/R9;
+/// other parameters remain unknown, including slots preceding the Proto object.
+pub(super) fn scan_planned_parameter_typed(
+    code: &[u8],
+    rva: usize,
+    mode: Mode,
+    terminal_calls: &BTreeSet<usize>,
+    exceptional_edges: &BTreeMap<usize, Vec<usize>>,
+    switch_edges: &BTreeMap<usize, Vec<usize>>,
+    code_bytes: Option<usize>,
+    bytes: usize,
+    proto_parameter_index: usize,
+) -> ScanResult {
+    scan_planned_exits_parameter_typed(
+        code,
+        rva,
+        mode,
+        terminal_calls,
+        exceptional_edges,
+        switch_edges,
+        code_bytes,
+        bytes,
+        &BTreeSet::new(),
+        proto_parameter_index,
+    )
+}
+
+/// Tail exits must separately prove current PE ownership, exact frame restore,
+/// declared target and protected epilogue entry. Never infer them from JMP alone.
+pub(super) fn scan_planned_exits_typed(
+    code: &[u8],
+    rva: usize,
+    mode: Mode,
+    terminal_calls: &BTreeSet<usize>,
+    exceptional_edges: &BTreeMap<usize, Vec<usize>>,
+    switch_edges: &BTreeMap<usize, Vec<usize>>,
+    code_bytes: Option<usize>,
+    bytes: usize,
+    tail_exits: &BTreeSet<usize>,
+) -> ScanResult {
+    scan_planned_exits_parameter_typed(
+        code,
+        rva,
+        mode,
+        terminal_calls,
+        exceptional_edges,
+        switch_edges,
+        code_bytes,
+        bytes,
+        tail_exits,
+        0,
+    )
+}
+
+/// Apply independently proven exits with the same explicit instance-parameter
+/// binding as scan_planned_parameter_typed. Setter value arguments remain RDX.
+pub(super) fn scan_planned_exits_parameter_typed(
+    code: &[u8],
+    rva: usize,
+    mode: Mode,
+    terminal_calls: &BTreeSet<usize>,
+    exceptional_edges: &BTreeMap<usize, Vec<usize>>,
+    switch_edges: &BTreeMap<usize, Vec<usize>>,
+    code_bytes: Option<usize>,
+    bytes: usize,
+    tail_exits: &BTreeSet<usize>,
+    proto_parameter_index: usize,
+) -> ScanResult {
+    scan_with_context(
+        code,
+        rva,
+        mode,
+        terminal_calls,
+        exceptional_edges,
+        switch_edges,
+        code_bytes,
+        bytes,
+        tail_exits,
+        proto_parameter_index,
+        None,
+    )
+}
+
+/// Scan a caller-verified static factory with its only Proto argument in RCX.
+/// No owner is seeded: a verified Class passed to the actual allocator must
+/// establish one. Literal calls are exposed only for a complete native CFG.
+pub(super) fn scan_factory_planned_typed(
+    code: &[u8],
+    rva: usize,
+    terminal_calls: &BTreeSet<usize>,
+    exceptional_edges: &BTreeMap<usize, Vec<usize>>,
+    switch_edges: &BTreeMap<usize, Vec<usize>>,
+    code_bytes: Option<usize>,
+    bytes: usize,
+    tail_exits: &BTreeSet<usize>,
+    context: &FactoryContext,
+) -> ScanResult {
+    scan_with_context(
+        code,
+        rva,
+        Mode::Sync,
+        terminal_calls,
+        exceptional_edges,
+        switch_edges,
+        code_bytes,
+        bytes,
+        tail_exits,
+        0,
+        Some(context),
+    )
+}
+
+fn scan_with_context(
+    code: &[u8],
+    rva: usize,
+    mode: Mode,
+    terminal_calls: &BTreeSet<usize>,
+    exceptional_edges: &BTreeMap<usize, Vec<usize>>,
+    switch_edges: &BTreeMap<usize, Vec<usize>>,
+    code_bytes: Option<usize>,
+    bytes: usize,
+    tail_exits: &BTreeSet<usize>,
+    proto_parameter_index: usize,
+    context: Option<&FactoryContext>,
+) -> ScanResult {
     let mut result = ScanResult::default();
+    let proto_register = match (context, proto_parameter_index) {
+        (Some(_), 0) if mode == Mode::Sync => Register::RCX,
+        (Some(_), _) => {
+            result.rejected_paths = 1;
+            result.ambiguous = true;
+            return result;
+        }
+        (None, 0) => Register::RDX,
+        (None, 1) if mode == Mode::Sync => Register::R8,
+        (None, 2) if mode == Mode::Sync => Register::R9,
+        _ => {
+            result.rejected_paths = 1;
+            result.ambiguous = true;
+            return result;
+        }
+    };
     if !matches!(bytes, 1 | 4 | 8) || rva.checked_add(code.len()).is_none() {
         result.rejected_paths = 1;
         return result;
@@ -620,7 +919,7 @@ pub(super) fn scan_planned_typed(
         let instruction = decoder.decode();
         result.decoded += 1;
         if instruction.is_invalid() {
-            if code_bytes.is_some() {
+            if code_bytes.is_some() || context.is_some() {
                 result.rejected_paths = 1;
                 result.ambiguous = true;
                 return result;
@@ -648,7 +947,47 @@ pub(super) fn scan_planned_typed(
             )
         })
     };
-    if !terminal_calls.iter().all(valid_call)
+    let valid_context = context.is_none_or(|context| {
+        context.allocator_rva != 0
+            && !context
+                .owner_class_loads
+                .keys()
+                .any(|site| context.literal_loads.contains_key(site))
+            && context
+                .owner_class_loads
+                .iter()
+                .chain(context.literal_loads.iter())
+                .all(|(site, slot)| {
+                    *slot != 0
+                        && positions.get(&(*site as u64)).is_some_and(|&n| {
+                            let i = &instructions[n];
+                            i.mnemonic() == Mnemonic::Mov
+                                && i.encoding() == EncodingKind::Legacy
+                                && i.op_count() == 2
+                                && i.op0_kind() == OpKind::Register
+                                && i.op0_register().size() == 8
+                                && i.op1_kind() == OpKind::Memory
+                                && i.memory_size().size() == 8
+                                && i.memory_base() == Register::RIP
+                                && i.memory_index() == Register::None
+                                && !i.has_segment_prefix()
+                                && !i.has_rep_prefix()
+                                && !i.has_repne_prefix()
+                                && usize::try_from(i.ip_rel_memory_address()).ok() == Some(*slot)
+                        })
+                })
+    });
+    if !valid_context
+        || !terminal_calls.iter().all(valid_call)
+        || !tail_exits.iter().all(|site| {
+            positions.get(&(*site as u64)).is_some_and(|&n| {
+                let i = &instructions[n];
+                i.flow_control() == FlowControl::UnconditionalBranch
+                    && i.op0_kind() == OpKind::NearBranch64
+                    && !(rva as u64..rva as u64 + code.len() as u64)
+                        .contains(&i.near_branch_target())
+            })
+        })
         || !exceptional_edges.iter().all(|(site, targets)| {
             valid_call(site)
                 && targets
@@ -681,16 +1020,21 @@ pub(super) fn scan_planned_typed(
                 terminal_calls,
                 exceptional_edges,
                 switch_edges,
+                tail_exits,
             )
         })
         .collect();
     // One joined state and one queued bit per actual instruction. Known values
     // only weaken; load provenance can grow only to this function's load sites.
     let mut states = vec![None; instructions.len()];
-    let mut seed = State::from([(Register::RCX, Value::BusinessPtr)]);
+    let mut seed = if context.is_some() {
+        State::new()
+    } else {
+        State::from([(Register::RCX, Value::BusinessPtr)])
+    };
     match mode {
         Mode::Sync => {
-            seed.insert(Register::RDX, Value::ProtoPtr);
+            seed.insert(proto_register, Value::ProtoPtr);
         }
         Mode::Setter => {
             seed.insert(Register::RDX, Value::SetterValue);
@@ -710,14 +1054,42 @@ pub(super) fn scan_planned_typed(
             states[index].as_ref().unwrap(),
             &mut factory,
             bytes,
+            context,
         );
+        let instruction = &instructions[index];
+        let returns_owner = context.is_some_and(|context| {
+            instruction.flow_control() == FlowControl::Call
+                && instruction.op0_kind() == OpKind::NearBranch64
+                && usize::try_from(instruction.near_branch_target()).ok()
+                    == Some(context.allocator_rva)
+                && states[index].as_ref().unwrap().get(&Register::RCX) == Some(&Value::OwnerClass)
+        });
+        let owner_out = returns_owner.then(|| {
+            let mut normal = out.clone();
+            normal.insert(Register::RAX, Value::BusinessPtr);
+            normal
+        });
         for &target in &edges[index].0 {
+            // The exceptional successor must never inherit an allocator's
+            // normal RAX return. If both edge kinds share a target, retaining
+            // the clobbered state is their conservative join.
+            let exceptional = exceptional_edges
+                .get(&(instruction.ip() as usize))
+                .is_some_and(|targets| targets.contains(&(instructions[target].ip() as usize)));
+            let edge_out = if returns_owner
+                && !exceptional
+                && instructions[target].ip() == instruction.next_ip()
+            {
+                owner_out.as_ref().unwrap()
+            } else {
+                &out
+            };
             let changed = if let Some(state) = &mut states[target] {
-                let (changed, conflict) = join(state, &out);
+                let (changed, conflict) = join(state, edge_out);
                 getter_join_conflict |= conflict;
                 changed
             } else {
-                states[target] = Some(out.clone());
+                states[target] = Some(edge_out.clone());
                 true
             };
             if changed && !queued[target] {
@@ -736,7 +1108,59 @@ pub(super) fn scan_planned_typed(
             continue;
         };
         result.rejected_paths += edges[index].1;
+        if edges[index].1 != 0 {
+            result.rejected_sites.push(instruction.ip() as usize);
+        }
         destination_writes.extend(business_writes(instruction, state, &mut factory, bytes));
+        if mode == Mode::Sync
+            && instruction.flow_control() == FlowControl::Call
+            && matches!(instruction.op0_kind(), OpKind::NearBranch64)
+            && let Ok(target_rva) = usize::try_from(instruction.near_branch_target())
+        {
+            if context.is_some()
+                && let Some(Value::LiteralSlot(literal_slot_rva)) = state.get(&Register::RDX)
+                && let Some(Value::ProtoField { offset, loads }) = state.get(&Register::R8)
+                && let Some(&load_rva) = loads.first()
+            {
+                result.literal_key_calls.push(LiteralKeyCall {
+                    call_rva: instruction.ip() as usize,
+                    target_rva,
+                    proto_offset: *offset,
+                    load_rva,
+                    literal_slot_rva: *literal_slot_rva,
+                });
+            }
+            if state.get(&Register::RCX) == Some(&Value::BusinessPtr) {
+                result.business_calls.push(BusinessCall {
+                    target_rva,
+                    source: match state.get(&Register::RDX) {
+                        Some(Value::ProtoField { offset, .. }) => {
+                            Some(WriteSource::ProtoField(*offset))
+                        }
+                        _ => None,
+                    },
+                });
+            }
+            for (argument_index, register) in
+                [Register::RCX, Register::RDX, Register::R8, Register::R9]
+                    .into_iter()
+                    .enumerate()
+            {
+                if let Some(Value::ProtoField { offset, loads }) = state.get(&register)
+                    && let Some(&load_rva) = loads.first()
+                {
+                    result.call_arguments.push(CallArgument {
+                        call_rva: instruction.ip() as usize,
+                        target_rva,
+                        argument_index,
+                        receiver_is_business: state.get(&Register::RCX)
+                            == Some(&Value::BusinessPtr),
+                        proto_offset: *offset,
+                        load_rva,
+                    });
+                }
+            }
+        }
         if mode == Mode::Getter && instruction.flow_control() == FlowControl::Return {
             if let Some(Value::BusinessField(offset)) = state.get(&Register::RAX) {
                 accessor_sites
@@ -754,6 +1178,7 @@ pub(super) fn scan_planned_typed(
                             business_offset: destination,
                             load_rva,
                             store_rva: instruction.ip() as usize,
+                            setter_call: false,
                         });
                     }
                 }
@@ -779,6 +1204,13 @@ pub(super) fn scan_planned_typed(
     });
     result.ambiguous |= count != result.copies.len();
     remove_copy_conflicts(&mut result);
+    // An unresolved native successor cannot establish a complete argument
+    // proof. Existing direct-store acceptance keeps its original policy.
+    result.witnessed_call_arguments = result.call_arguments.len();
+    if result.rejected_paths != 0 {
+        result.call_arguments.clear();
+        result.literal_key_calls.clear();
+    }
     if accessor_sites.len() == 1 && !(mode == Mode::Getter && getter_join_conflict) {
         let (offset, sites) = accessor_sites.into_iter().next().unwrap();
         if mode == Mode::Setter
@@ -795,8 +1227,21 @@ pub(super) fn scan_planned_typed(
         result.ambiguous |=
             accessor_sites.len() > 1 || (mode == Mode::Getter && getter_join_conflict);
     }
+    result.destination_writes = destination_writes;
     result
 }
+
+#[cfg(test)]
+#[path = "sync_call_tests.rs"]
+mod call_tests;
+
+#[cfg(test)]
+#[path = "sync_parameter_tests.rs"]
+mod parameter_tests;
+
+#[cfg(test)]
+#[path = "sync_factory_tests.rs"]
+mod factory_tests;
 
 #[cfg(test)]
 mod tests {

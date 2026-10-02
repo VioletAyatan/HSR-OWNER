@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use il2cpp::{
     FUNCTIONS_TABLE_REFLECTION, GA_BASE,
-    vm::{array::Il2CppArray, boxed_value::BoxedBool, object::Il2CppObject},
+    vm::{array::Il2CppArray, boxed_value::BoxedBool, method::Il2CppMethod, object::Il2CppObject},
 };
 use reflection::{
     attributes::MethodAttributes, method_info::MethodInfo, parameter_info::RuntimeParameterInfo,
@@ -24,10 +24,14 @@ use windows::{
 use super::{
     asm_address::module_rva,
     cache::{CachedType, TypeCache},
+    call_argument_names::{
+        ArgumentLocation, CallArgumentNameReport, CandidateInput, TypeBoundEvidence,
+    },
     field_metadata::checked_name,
     names::{ScopedFieldNames, field_name_key, identifier},
     native_flow::{Binding, Plan, Resolver, Statistics},
     native_pe::Pe,
+    native_tail,
     output::{ProtoItem, TypeToItemMap, snake_field},
     rsp_scan::FunctionTable,
     sync_scan::{self, Mode},
@@ -35,8 +39,21 @@ use super::{
 };
 use crate::{dump_progress::Progress, script::memory};
 
+#[path = "sync_constructor.rs"]
+mod constructors;
 #[path = "sync_declared_fields.rs"]
 mod declared_fields;
+#[path = "sync_parameter.rs"]
+mod parameter_types;
+#[path = "sync_property_name.rs"]
+mod property_names;
+#[path = "sync_signature.rs"]
+mod signatures;
+#[path = "sync_factory_binding.rs"]
+pub(super) mod factory_binding;
+
+use parameter_types::ParameterProof;
+use property_names::PropertyNameProof;
 
 #[derive(Clone)]
 struct Accessor {
@@ -48,6 +65,7 @@ struct Accessor {
     getter_rva: usize,
     setter_rva: usize,
     member_kind: &'static str,
+    name_proof: Option<PropertyNameProof>,
 }
 
 #[derive(Serialize)]
@@ -61,9 +79,18 @@ struct Evidence {
     business_offset: u32,
     business_property_type: String,
     business_member_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    business_property_name_proof: Option<PropertyNameProof>,
     kind: String,
     native_bytes: usize,
+    copy_binding: &'static str,
     sync_method: String,
+    sync_signature: String,
+    method_binding: &'static str,
+    managed_parameter_count: usize,
+    proto_parameter_index: usize,
+    proto_argument_register: &'static str,
+    parameter_types: Vec<ParameterProof>,
     sync_return_type: String,
     return_abi: &'static str,
     sync_rva: usize,
@@ -76,18 +103,73 @@ struct Evidence {
 }
 
 #[derive(Default, Serialize)]
+struct MethodDecision {
+    signature: String,
+    sync_rva: Option<usize>,
+    stage: String,
+    reason: String,
+    copies: usize,
+    setter_call_copies: usize,
+    new_evidence: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_parameter_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proto_parameter_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proto_argument_register: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    parameter_types: Vec<ParameterProof>,
+    native_scans: Vec<ScanDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_tail: Option<native_tail::Proof>,
+}
+
+#[derive(Serialize)]
+struct ScanDecision {
+    bytes: usize,
+    decoded: usize,
+    rejected_paths: usize,
+    rejected_sites: Vec<usize>,
+    witnessed_call_arguments: usize,
+    proven_call_arguments: usize,
+}
+
+#[derive(Default, Serialize)]
+struct PropertyDecision {
+    context_signature: String,
+    metadata_name: Option<String>,
+    getter_name: Option<String>,
+    setter_name: Option<String>,
+    stage: String,
+    reason: String,
+    business_offset: Option<u32>,
+    width: Option<usize>,
+}
+
+#[derive(Default, Serialize)]
 pub(super) struct SyncFields {
     methods_considered: usize,
     sync_methods: usize,
     specialized_sync_methods: usize,
     other_proto_methods: usize,
+    constructors: usize,
     reference_return_methods: usize,
+    multi_parameter_methods: usize,
+    shifted_proto_methods: usize,
     unsupported_return_types: usize,
     owners: usize,
     typed_accessors: usize,
     declared_fields: usize,
+    obfuscated_property_names: usize,
+    accessor_named_properties: usize,
     copies: usize,
+    setter_call_copies: usize,
     conflicts: usize,
+    call_metadata_errors: usize,
+    shared_factory_targets: usize,
+    call_parameter_names: Vec<CallArgumentNameReport>,
+    proven_tail_exits: usize,
+    unsupported_tail_callers: usize,
     unbound_accessors: usize,
     metadata_errors: usize,
     control_flow_errors: usize,
@@ -95,6 +177,10 @@ pub(super) struct SyncFields {
     reflection_array_shapes: HashMap<String, usize>,
     other_reflection_arrays: usize,
     evidence: Vec<Evidence>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    methods_decisions: Vec<MethodDecision>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    property_decisions: Vec<PropertyDecision>,
     #[serde(skip)]
     pub names: ScopedFieldNames,
     #[serde(skip)]
@@ -125,25 +211,61 @@ fn sync_signature(signature: &str) -> bool {
 }
 
 fn proto_signature(signature: &str, message_names: &HashSet<String>) -> bool {
+    signatures::has_proto_parameter(signature, message_names)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParameterAbi {
+    ProtoMessage,
+    Scalar,
+    Unsupported,
+}
+
+fn parameter_slot(parameters: &[ParameterAbi]) -> std::result::Result<usize, &'static str> {
+    let mut selected = None;
+    for (index, parameter) in parameters.iter().enumerate() {
+        if *parameter == ParameterAbi::ProtoMessage {
+            if selected.replace(index).is_some() {
+                return Err("multiple-current-proto-message-parameters");
+            }
+        }
+    }
+    let index = selected.ok_or("no-current-proto-message-parameter")?;
+    // RCX is the instance. Only these three managed ordinals have a modeled
+    // register location; later parameters require a separate stack proof.
+    if index > 2 {
+        return Err("proto-parameter-requires-stack-argument-proof");
+    }
+    if parameters.contains(&ParameterAbi::Unsupported) {
+        return Err("unsupported-extra-parameter-abi");
+    }
+    Ok(index)
+}
+
+fn scalar_parameter(cached: Option<&CachedType>) -> bool {
+    // Exact current RuntimeType cache identity establishes primitive scalar
+    // ABI. References, enums, structs, pointers and byrefs are not inferred.
+    sync_return_abi("", cached)
+}
+
+fn constructor_signature(signature: &str, message_names: &HashSet<String>) -> bool {
     let Some((_, method)) = signature.rsplit_once("::") else {
         return false;
     };
-    let Some((name, arguments)) = method.split_once('(') else {
+    let Some(argument) = method
+        .strip_prefix(".ctor(")
+        .and_then(|arguments| arguments.strip_suffix(')'))
+    else {
         return false;
     };
-    // Constructor reflection uses another runtime class. Ordinary methods
-    // still require the actual instance, parameter and return metadata below.
-    !matches!(name, ".ctor" | ".cctor")
-        && arguments.strip_suffix(')').is_some_and(|argument| {
-            message_names.contains(argument)
-                || argument
-                    .strip_prefix("Proto.")
-                    .is_some_and(|name| message_names.contains(name))
-        })
+    message_names.contains(argument)
+        || argument
+            .strip_prefix("Proto.")
+            .is_some_and(|name| message_names.contains(name))
 }
 
 fn sync_return_abi(name: &str, cached: Option<&CachedType>) -> bool {
-    // The scanner models RCX=this, RDX=Proto. An aggregate return can insert
+    // The scanner models RCX=this and the actual Proto parameter slot. An aggregate return can insert
     // a hidden first argument and shift both, so only known scalar/void
     // returns establish this calling convention.
     name == "System.Void"
@@ -395,6 +517,76 @@ fn parameters(method: MethodInfo, out: &mut SyncFields) -> Result<Vec<RuntimePar
     )
 }
 
+struct FactoryParameters {
+    signature: String,
+    return_name: String,
+    parameters: Vec<(String, RuntimeType, String)>,
+}
+
+// Diagnostic capture only. A metadata parameter name does not prove where a
+// factory stores it, and never overrides an existing Proto name here.
+fn factory_parameters(
+    handle: Il2CppMethod,
+    target: usize,
+    image: &[u8],
+    bounds: &Bounds<'_>,
+    out: &mut SyncFields,
+) -> Result<Option<FactoryParameters>> {
+    memory::readable(handle.0, 16)?;
+    if matches!(handle.get_name().as_ref(), ".ctor" | ".cctor") {
+        return Ok(None);
+    }
+    let method = MethodInfo::from_handle(handle)?;
+    memory::readable(method.0, 24)?;
+    ensure!(
+        Il2CppObject(method.0).get_class()
+            == il2cpp::get_cached_class("System.Reflection.MonoMethod")
+                .context("MonoMethod class unavailable")?,
+        "factory reflection object is not MonoMethod"
+    );
+    let attrs = method.get_attributes()?;
+    memory::readable(attrs.0, 20)?;
+    if !attrs.unbox().contains(MethodAttributes::Static)
+        || reflection_bool(method.get_is_generic_method()?)?
+    {
+        return Ok(None);
+    }
+    let owner = method.get_declaring_type()?;
+    let returned = method.get_return_type()?;
+    if owner != returned || !managed_reference(returned)? {
+        return Ok(None);
+    }
+    ensure!(
+        native_body(handle, image, bounds)?.0 == target,
+        "factory native target does not match metadata"
+    );
+    let return_name = checked_name(returned.get_full_name()?)?;
+    let name = checked_name(method.get_name()?)?;
+    let mut params = Vec::new();
+    for parameter in parameters(method, out)? {
+        let ty = parameter.get_parameter_type()?;
+        memory::readable(ty.0, 24)?;
+        params.push((
+            checked_name(parameter.get_name()?)?,
+            ty,
+            checked_name(ty.get_full_name()?)?,
+        ));
+    }
+    let signature = format!(
+        "{return_name}::{name}({})",
+        params
+            .iter()
+            .map(|(_, _, name)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    Ok(Some(FactoryParameters {
+        signature,
+        return_name,
+        parameters: params,
+    }))
+}
+
 struct Bounds<'a> {
     functions: FunctionTable<'a>,
     entries: Vec<usize>,
@@ -445,6 +637,14 @@ fn executable_ranges(image: &[u8]) -> Result<Vec<std::ops::Range<usize>>> {
 
 fn body<'a>(method: MethodInfo, image: &'a [u8], bounds: &Bounds<'_>) -> Result<(usize, &'a [u8])> {
     let handle = method.get_il2cpp_method();
+    native_body(handle, image, bounds)
+}
+
+fn native_body<'a>(
+    handle: Il2CppMethod,
+    image: &'a [u8],
+    bounds: &Bounds<'_>,
+) -> Result<(usize, &'a [u8])> {
     memory::readable(handle.0, 16)?;
     let rva = module_rva(handle.va(), *GA_BASE, image.len())
         .filter(|rva| *rva != 0)
@@ -490,11 +690,17 @@ impl SyncFields {
     fn accessors(
         &mut self,
         owner: RuntimeType,
+        context_signature: &str,
         cache: &TypeCache,
         image: &[u8],
         bounds: &Bounds<'_>,
     ) -> Result<Vec<Accessor>> {
         let mut out = Vec::new();
+        memory::readable(owner.0, 24)?;
+        let class = owner.get_il2cpp_type().get_class();
+        memory::readable(class.0, 16)?;
+        let instance_size = usize::try_from(il2cpp::api::il2cpp_class_instance_size(class))
+            .context("invalid business instance size")?;
         // DeclaredOnly | Instance | Public | NonPublic. Inherited properties
         // must not supply names for another owner's native object layout.
         for property in references::<PropertyInfo>(
@@ -502,22 +708,38 @@ impl SyncFields {
             "System.Reflection.PropertyInfo",
             self,
         )? {
+            let mut decision = PropertyDecision {
+                context_signature: context_signature.to_owned(),
+                stage: "property-metadata".to_owned(),
+                reason: "not-processed".to_owned(),
+                ..PropertyDecision::default()
+            };
             let result = (|| -> Result<Option<Accessor>> {
                 ensure!(property.0 != 0, "null business property");
-                let name = checked_name(property.get_name()?)?;
-                if !identifier(&name) || is_obf(&name) {
+                let metadata_name = checked_name(property.get_name()?)?;
+                decision.metadata_name = Some(metadata_name.clone());
+                if !identifier(&metadata_name) {
+                    decision.reason = "invalid-property-name-identifier".to_owned();
                     return Ok(None);
                 }
+                let obfuscated_name = is_obf(&metadata_name);
+                decision.stage = "property-type".to_owned();
+                self.obfuscated_property_names += usize::from(obfuscated_name);
                 let ty = property.get_property_type()?;
                 let Some((kind, bytes)) = accessor_kind(ty, cache)? else {
+                    decision.reason = "unsupported-property-type".to_owned();
                     return Ok(None);
                 };
+                decision.width = Some(bytes);
+                decision.stage = "property-accessors".to_owned();
                 let getter = property.get_get_method(true)?;
                 let setter = property.get_set_method(true)?;
                 if getter.0 == 0 || setter.0 == 0 {
+                    decision.reason = "missing-getter-or-setter".to_owned();
                     return Ok(None);
                 }
                 if !instance(getter, owner)? || !instance(setter, owner)? {
+                    decision.reason = "accessor-not-instance-or-declared-by-owner".to_owned();
                     return Ok(None);
                 }
                 let getter_params = parameters(getter, self)?;
@@ -528,8 +750,37 @@ impl SyncFields {
                     || setter_params[0].get_parameter_type()? != ty
                     || checked_name(setter.get_return_type()?.get_full_name()?)? != "System.Void"
                 {
+                    decision.reason = "accessor-signature-type-mismatch-or-indexer".to_owned();
                     return Ok(None);
                 }
+                // Obtain both methods from this exact PropertyInfo. Their
+                // names supply a business alias only when the property name
+                // is obfuscated; they never bypass identity/type/offset gates.
+                let (getter_name, setter_name) = if obfuscated_name {
+                    decision.stage = "accessor-name-proof".to_owned();
+                    if reflection_bool(getter.get_is_generic_method()?)?
+                        || reflection_bool(setter.get_is_generic_method()?)?
+                    {
+                        decision.reason = "generic-accessor-method".to_owned();
+                        return Ok(None);
+                    }
+                    let getter_name = checked_name(getter.get_name()?)?;
+                    decision.getter_name = Some(getter_name.clone());
+                    let setter_name = checked_name(setter.get_name()?)?;
+                    decision.setter_name = Some(setter_name.clone());
+                    (Some(getter_name), Some(setter_name))
+                } else {
+                    (None, None)
+                };
+                let Some((name, name_proof)) = property_names::recover(
+                    Some(&metadata_name),
+                    getter_name.as_deref(),
+                    setter_name.as_deref(),
+                ) else {
+                    decision.reason = "property-and-accessor-name-proof-rejected".to_owned();
+                    return Ok(None);
+                };
+                decision.stage = "accessor-native-offset".to_owned();
                 let (getter_rva, getter_body) = body(getter, image, bounds)?;
                 let (setter_rva, setter_body) = body(setter, image, bounds)?;
                 let read = sync_scan::scan_typed(getter_body, getter_rva, Mode::Getter, bytes);
@@ -539,8 +790,19 @@ impl SyncFields {
                     .filter(|offset| *offset >= 16 && Some(*offset) == write.accessor_offset)
                 else {
                     self.unbound_accessors += 1;
+                    decision.reason = "getter-setter-offset-unbound".to_owned();
                     return Ok(None);
                 };
+                decision.business_offset = Some(offset);
+                ensure!(
+                    (offset as usize)
+                        .checked_add(bytes)
+                        .is_some_and(|end| end <= instance_size),
+                    "business property offset exceeds its instance layout"
+                );
+                decision.stage = "accepted-property".to_owned();
+                decision.reason = "property-name-type-and-native-offset-proven".to_owned();
+                self.accessor_named_properties += usize::from(obfuscated_name);
                 Ok(Some(Accessor {
                     name: snake_field(&name),
                     kind,
@@ -550,21 +812,32 @@ impl SyncFields {
                     getter_rva,
                     setter_rva,
                     member_kind: "property",
+                    name_proof: Some(name_proof),
                 }))
             })();
             match result {
                 Ok(Some(accessor)) => out.push(accessor),
-                Ok(None) => {}
-                Err(error) => self.failure(format_args!("property=0x{:X}: {error:#}", property.0)),
+                Ok(None) => {
+                    if decision.reason == "not-processed" {
+                        decision.reason = "rejected-at-current-stage".to_owned();
+                    }
+                }
+                Err(error) => {
+                    decision.reason = format!("metadata-or-native-error: {error:#}");
+                    self.failure(format_args!("property=0x{:X}: {error:#}", property.0));
+                }
             }
+            self.property_decisions.push(decision);
         }
         // Different semantic properties sharing an offset provide no unique
         // business name, even if their current native accessors are aliases.
+        let property_slots: Vec<_> = out.iter().map(|a| (a.offset, a.bytes)).collect();
         let mut grouped = HashMap::<u32, Vec<Accessor>>::new();
         for accessor in out {
             grouped.entry(accessor.offset).or_default().push(accessor);
         }
         let mut unique = Vec::new();
+        let mut conflicting_property_offsets = HashSet::new();
         for group in grouped.into_values() {
             if group.iter().all(|a| {
                 a.name == group[0].name
@@ -575,6 +848,19 @@ impl SyncFields {
                 unique.push(group[0].clone());
             } else {
                 self.conflicts += 1;
+                conflicting_property_offsets.insert(group[0].offset);
+            }
+        }
+        if !conflicting_property_offsets.is_empty() {
+            for decision in &mut self.property_decisions {
+                if decision.context_signature == context_signature
+                    && decision
+                        .business_offset
+                        .is_some_and(|offset| conflicting_property_offsets.contains(&offset))
+                {
+                    decision.stage = "business-property-conflict".to_owned();
+                    decision.reason = "different-property-identities-share-offset".to_owned();
+                }
             }
         }
         match declared_fields::collect(owner, cache, self) {
@@ -582,9 +868,10 @@ impl SyncFields {
                 for field in fields {
                     // Preserve the independently checked property route at
                     // every overlapping slot. Plain fields only add new slots.
-                    if unique.iter().any(|property| {
-                        let left = u64::from(property.offset)..u64::from(property.offset) + property.bytes as u64;
-                        let right = u64::from(field.offset)..u64::from(field.offset) + field.bytes as u64;
+                    if property_slots.iter().any(|&(offset, bytes)| {
+                        let left = u64::from(offset)..u64::from(offset) + bytes as u64;
+                        let right =
+                            u64::from(field.offset)..u64::from(field.offset) + field.bytes as u64;
                         left.start < right.end && right.start < left.end
                     }) {
                         continue;
@@ -704,14 +991,16 @@ impl SyncFields {
             };
         }
         log::info!(
-            "[Sync Fields] complete: methods={} sync_methods={} specialized_sync_methods={} other_proto_methods={} unsupported_returns={} owners={} accessors={} copies={} accepted_tags={} preserved_tags={} existing_name_collisions={} conflicts={} unbound_accessors={} metadata_errors={}",
+            "[Sync Fields] complete: methods={} sync_methods={} specialized_sync_methods={} other_proto_methods={} reference_returns={} unsupported_returns={} owners={} members={} declared_fields={} copies={} accepted_tags={} preserved_tags={} existing_name_collisions={} conflicts={} unbound_accessors={} metadata_errors={}",
             self.methods_considered,
             self.sync_methods,
             self.specialized_sync_methods,
             self.other_proto_methods,
+            self.reference_return_methods,
             self.unsupported_return_types,
             self.owners,
             self.typed_accessors,
+            self.declared_fields,
             self.copies,
             accepted.len(),
             self.preserved_existing.len(),
@@ -722,7 +1011,7 @@ impl SyncFields {
         );
         let report = serde_json::json!({
             "game_version": &*crate::version::GAME_VERSION,
-            "source": "current instance native methods with one Proto parameter, direct copy and own typed property getter/setter with equal runtime types; hotfix overrides are not executed by this collector",
+            "source": "current instance native methods with one Proto parameter and exact typed copy to own property getter/setter (direct store or bound setter call) or non-overlapping declared instance field; validated tail exits prove frame restoration only, hotfix overrides are not executed by this collector",
             "accepted_tags": accepted.len(), "preserved_tags": self.preserved_existing.len(),
             "existing_name_collisions": self.rejected_existing_collisions.len(), "summary": self,
         });
@@ -747,6 +1036,9 @@ fn collect_inner(
     let methods = crate::script::METHODS
         .get()
         .context("Script method entries unavailable")?;
+    let shared_method_rvas = crate::script::METHODS_SHARED_RVAS
+        .get()
+        .context("Script shared method-entry evidence unavailable")?;
     let executable = executable_ranges(image)?;
     let mut entries: Vec<_> = methods
         .keys()
@@ -798,7 +1090,9 @@ fn collect_inner(
     let candidates: Vec<_> = table
         .iter()
         .filter(|(signature, _)| {
-            sync_signature(signature) || proto_signature(signature, &message_names)
+            sync_signature(signature)
+                || proto_signature(signature, &message_names)
+                || constructor_signature(signature, &message_names)
         })
         .collect();
     let enum_names: HashSet<_> = items
@@ -813,9 +1107,17 @@ fn collect_inner(
         .collect();
     progress.stage("business Proto copy field names", candidates.len());
     let mut accessors = HashMap::<RuntimeType, Vec<Accessor>>::new();
+    let mut factory_cache = HashMap::<usize, Option<FactoryParameters>>::new();
     for (index, (signature, handle)) in candidates.into_iter().enumerate() {
         out.methods_considered += 1;
         out.context = signature.clone();
+        let mut decision = MethodDecision {
+            signature: signature.clone(),
+            stage: "method-binding".to_owned(),
+            reason: "not-processed".to_owned(),
+            ..MethodDecision::default()
+        };
+        let evidence_before = out.evidence.len();
         progress.step(
             index,
             handle.0,
@@ -823,45 +1125,148 @@ fn collect_inner(
         );
         let result = (|| -> Result<()> {
             memory::readable(handle.0, 16)?;
-            let method = MethodInfo::from_handle(*handle)?;
-            ensure!(method.0 != 0, "null business method");
-            let owner = method.get_declaring_type()?;
-            let name = checked_name(method.get_name()?)?;
-            if items.contains_key(&owner) || !instance(method, owner)? || !managed_reference(owner)? {
+            let constructor = constructor_signature(signature, &message_names);
+            let (owner, proto, return_type, name, return_abi, parameter_count, proto_index) =
+                if constructor {
+                    decision.stage = "constructor-binding".to_owned();
+                    let Some(bound) = constructors::bind(*handle)? else {
+                        decision.reason = "constructor-not-eligible".to_owned();
+                        return Ok(());
+                    };
+                    decision.parameter_types.push(ParameterProof::proto(
+                        0,
+                        checked_name(bound.proto.get_full_name()?)?,
+                    ));
+                    (
+                        bound.owner,
+                        bound.proto,
+                        bound.return_type,
+                        ".ctor".to_owned(),
+                        "void",
+                        1,
+                        0,
+                    )
+                } else {
+                    let method = MethodInfo::from_handle(*handle)?;
+                    ensure!(method.0 != 0, "null business method");
+                    let owner = method.get_declaring_type()?;
+                    let name = checked_name(method.get_name()?)?;
+                    if items.contains_key(&owner) {
+                        decision.reason = "owner-is-proto-type".to_owned();
+                        return Ok(());
+                    }
+                    decision.stage = "instance-owner-binding".to_owned();
+                    if !instance(method, owner)? {
+                        decision.reason = "method-not-instance-or-declared-by-owner".to_owned();
+                        return Ok(());
+                    }
+                    if !managed_reference(owner)? {
+                        decision.reason = "owner-not-managed-reference".to_owned();
+                        return Ok(());
+                    }
+                    if reflection_bool(method.get_is_generic_method()?)? {
+                        decision.reason = "generic-method-abi-not-proven".to_owned();
+                        return Ok(());
+                    }
+                    decision.stage = "proto-parameter-binding".to_owned();
+                    let params = parameters(method, out)?;
+                    decision.managed_parameter_count = Some(params.len());
+                    let mut parameter_types = Vec::with_capacity(params.len());
+                    let mut parameter_abis = Vec::with_capacity(params.len());
+                    for (parameter_index, parameter) in params.iter().enumerate() {
+                        let ty = parameter.get_parameter_type()?;
+                        memory::readable(ty.0, 24)?;
+                        let is_message = items
+                            .get(&ty)
+                            .is_some_and(|item| matches!(&*item.borrow(), ProtoItem::Message(_)));
+                        let abi = if is_message && managed_reference(ty)? {
+                            decision.parameter_types.push(ParameterProof::proto(
+                                parameter_index,
+                                checked_name(ty.get_full_name()?)?,
+                            ));
+                            ParameterAbi::ProtoMessage
+                        } else if let Some(proof) =
+                            parameter_types::classify(parameter_index, ty, cache)?
+                        {
+                            decision.parameter_types.push(proof);
+                            ParameterAbi::Scalar
+                        } else {
+                            decision.parameter_types.push(ParameterProof::unsupported(
+                                parameter_index,
+                                checked_name(ty.get_full_name()?)?,
+                            ));
+                            ParameterAbi::Unsupported
+                        };
+                        parameter_types.push(ty);
+                        parameter_abis.push(abi);
+                    }
+                    let proto_index = match parameter_slot(&parameter_abis) {
+                        Ok(index) => index,
+                        Err(reason) => {
+                            decision.reason = reason.to_owned();
+                            return Ok(());
+                        }
+                    };
+                    let proto = parameter_types[proto_index];
+                    decision.proto_parameter_index = Some(proto_index);
+                    decision.proto_argument_register = Some(["RDX", "R8", "R9"][proto_index]);
+                    decision.stage = "return-abi".to_owned();
+                    let return_type = method.get_return_type()?;
+                    let return_name = checked_name(return_type.get_full_name()?)?;
+                    let Some(abi) = return_abi(method, return_type, &return_name, cache)? else {
+                        out.unsupported_return_types += 1;
+                        if out.unsupported_return_types <= 12 {
+                            log::debug!(
+                                "[Sync Fields] unsupported return ABI: method={} return_type={}",
+                                signature,
+                                return_name
+                            );
+                        }
+                        decision.reason = "unsupported-return-abi".to_owned();
+                        return Ok(());
+                    };
+                    (
+                        owner,
+                        proto,
+                        return_type,
+                        name,
+                        abi,
+                        params.len(),
+                        proto_index,
+                    )
+                };
+            let proto_register = ["RDX", "R8", "R9"][proto_index];
+            decision.managed_parameter_count = Some(parameter_count);
+            decision.proto_parameter_index = Some(proto_index);
+            decision.proto_argument_register = Some(proto_register);
+            if items.contains_key(&owner) {
+                decision.stage = "instance-owner-binding".to_owned();
+                decision.reason = "owner-is-proto-type".to_owned();
                 return Ok(());
             }
-            let params = parameters(method, out)?;
-            if params.len() != 1 {
-                return Ok(());
-            }
-            let proto = params[0].get_parameter_type()?;
+            decision.stage = "proto-message-binding".to_owned();
             let Some(item) = items.get(&proto) else {
+                decision.reason = "parameter-is-not-current-proto-type".to_owned();
                 return Ok(());
             };
             let item = item.borrow();
             let ProtoItem::Message(message) = &*item else {
+                decision.reason = "proto-parameter-is-not-message".to_owned();
                 return Ok(());
             };
-            let return_type = method.get_return_type()?;
             let return_name = checked_name(return_type.get_full_name()?)?;
-            let Some(return_abi) = return_abi(method, return_type, &return_name, cache)? else {
-                out.unsupported_return_types += 1;
-                if out.unsupported_return_types <= 12 {
-                    log::debug!(
-                        "[Sync Fields] unsupported return ABI: method={} return_type={}",
-                        signature,
-                        return_name
-                    );
-                }
-                return Ok(());
-            };
             out.sync_methods += 1;
+            out.constructors += usize::from(constructor);
             out.reference_return_methods += usize::from(return_abi == "managed-reference");
+            out.multi_parameter_methods += usize::from(parameter_count > 1);
+            out.shifted_proto_methods += usize::from(proto_index != 0);
             out.other_proto_methods += usize::from(!sync_method_name(&name));
             out.specialized_sync_methods += usize::from(
                 sync_method_name(&name) && !matches!(name.as_str(), "Sync" | "SyncFrom"),
             );
-            let (rva, code) = body(method, image, &bounds)?;
+            decision.stage = "native-method-body".to_owned();
+            let (rva, code) = native_body(*handle, image, &bounds)?;
+            decision.sync_rva = Some(rva);
             let plan = match flow.as_mut().map(|flow| flow.plan(rva, code)).transpose() {
                 Ok(plan) => plan.unwrap_or_default(),
                 Err(error) => {
@@ -876,21 +1281,23 @@ fn collect_inner(
                     Plan::default()
                 }
             };
-            if !plan.terminal_calls.is_empty()
+            if (!plan.terminal_calls.is_empty() || !plan.switch_edges.is_empty())
                 && flow
                     .as_ref()
                     .is_some_and(|flow| flow.stats.planned_callers <= 12)
             {
                 log::debug!(
-                    "[Sync Flow] method={} rva=0x{:X} terminal_calls={} catch_edges={} funcinfo={:?}",
+                    "[Sync Flow] method={} rva=0x{:X} terminal_calls={} catch_edges={} switch_dispatches={} switch_targets={} funcinfo={:?}",
                     signature,
                     rva,
                     plan.terminal_calls.len(),
                     plan.exceptional_edges.values().map(Vec::len).sum::<usize>(),
+                    plan.switch_edges.len(),
+                    plan.switch_edges.values().map(Vec::len).sum::<usize>(),
                     plan.funcinfo_rva
                 );
             }
-            let mut copies = Vec::new();
+            let mut scans = Vec::new();
             for bytes in [4, 1, 8] {
                 if !message
                     .fields
@@ -899,7 +1306,7 @@ fn collect_inner(
                 {
                     continue;
                 }
-                let copied = sync_scan::scan_planned_typed(
+                let copied = sync_scan::scan_planned_parameter_typed(
                     code,
                     rva,
                     Mode::Sync,
@@ -908,19 +1315,227 @@ fn collect_inner(
                     &plan.switch_edges,
                     plan.code_bytes,
                     bytes,
+                    proto_index,
                 );
-                copies.extend(copied.copies.into_iter().map(|copy| (bytes, copy)));
+                scans.push((bytes, copied));
             }
-            out.copies += copies.len();
-            if copies.is_empty() {
+            // An external JMP is an exit only after proving current frame
+            // restoration and a separate declared target. Unknown successors
+            // remain rejected; this never executes an ILFix override.
+            if scans
+                .iter()
+                .any(|(_, scan)| scan.witnessed_call_arguments != 0 && scan.rejected_paths != 0)
+            {
+                match native_tail::exits(code, rva, bounds.functions.containing(rva), |target| {
+                    bounds.entries.binary_search(&target).is_ok()
+                        && bounds
+                            .functions
+                            .containing(target)
+                            .is_some_and(|range| range.start == target)
+                        && bounds
+                            .executable
+                            .iter()
+                            .any(|range| range.contains(&target))
+                }) {
+                    Ok(proof) => {
+                        let exits = proof.exits.iter().map(|exit| exit.site).collect();
+                        for (bytes, scan) in &mut scans {
+                            *scan = sync_scan::scan_planned_exits_parameter_typed(
+                                code,
+                                rva,
+                                Mode::Sync,
+                                &plan.terminal_calls,
+                                &plan.exceptional_edges,
+                                &plan.switch_edges,
+                                plan.code_bytes,
+                                *bytes,
+                                &exits,
+                                proto_index,
+                            );
+                        }
+                        out.proven_tail_exits += proof.exits.len();
+                        decision.native_tail = Some(proof);
+                    }
+                    Err(error) => {
+                        out.unsupported_tail_callers += 1;
+                        if out.unsupported_tail_callers <= 12 {
+                            log::debug!(
+                                "[Sync Tail] stage=frame/entry validation caller={} rva=0x{:X} reason={error:#}; retain unknown-exit rejection",
+                                signature,
+                                rva
+                            );
+                        }
+                    }
+                }
+            }
+            for (bytes, copied) in &scans {
+                decision.native_scans.push(ScanDecision {
+                    bytes: *bytes,
+                    decoded: copied.decoded,
+                    rejected_paths: copied.rejected_paths,
+                    rejected_sites: copied.rejected_sites.clone(),
+                    witnessed_call_arguments: copied.witnessed_call_arguments,
+                    proven_call_arguments: copied.call_arguments.len(),
+                });
+            }
+            for (bytes, scan) in &scans {
+                for argument in &scan.call_arguments {
+                    let mut fields = message.fields.iter().filter(|field| {
+                        field.offset == argument.proto_offset
+                            && wire_bytes(&field.kind, &enum_names) == Some(*bytes)
+                    });
+                    let Some(field) = fields.next() else {
+                        continue;
+                    };
+                    if fields.next().is_some()
+                        || message
+                            .oneofs
+                            .iter()
+                            .flat_map(|oneof| &oneof.fields)
+                            .any(|other| other.offset == field.offset)
+                    {
+                        continue;
+                    }
+                    if !factory_cache.contains_key(&argument.target_rva) {
+                        let found = if shared_method_rvas.contains(&(argument.target_rva as u64)) {
+                            out.shared_factory_targets += 1;
+                            if out.shared_factory_targets <= 12 {
+                                log::debug!(
+                                    "[Sync Call Names] stage=callee-identity caller={} call=0x{:X} target=0x{:X} reason=ambiguous-shared-native-rva; parameter names not captured",
+                                    signature,
+                                    argument.call_rva,
+                                    argument.target_rva
+                                );
+                            }
+                            Ok(None)
+                        } else {
+                            methods
+                                .get(&(argument.target_rva as u64))
+                                .map(|handle| {
+                                    factory_parameters(
+                                        *handle,
+                                        argument.target_rva,
+                                        image,
+                                        &bounds,
+                                        out,
+                                    )
+                                })
+                                .transpose()
+                        };
+                        let captured = match found {
+                            Ok(found) => found.flatten(),
+                            Err(error) => {
+                                out.call_metadata_errors += 1;
+                                if out.call_metadata_errors <= 12 {
+                                    log::debug!(
+                                        "[Sync Call Names] stage=metadata caller={} call=0x{:X} target=0x{:X} reason={error:#}",
+                                        signature,
+                                        argument.call_rva,
+                                        argument.target_rva
+                                    );
+                                }
+                                None
+                            }
+                        };
+                        factory_cache.insert(argument.target_rva, captured);
+                    }
+                    let Some(factory) = factory_cache[&argument.target_rva].as_ref() else {
+                        continue;
+                    };
+                    let Some((parameter_name, parameter_type, type_name)) =
+                        factory.parameters.get(argument.argument_index)
+                    else {
+                        continue;
+                    };
+                    let matching_type = match same_proto_property(
+                        proto,
+                        &field.name,
+                        *parameter_type,
+                    ) {
+                        Ok(matches) => matches,
+                        Err(error) => {
+                            out.call_metadata_errors += 1;
+                            if out.call_metadata_errors <= 12 {
+                                log::debug!(
+                                    "[Sync Call Names] stage=parameter-type caller={} field={} call=0x{:X} reason={error:#}",
+                                    signature,
+                                    field.name,
+                                    argument.call_rva
+                                );
+                            }
+                            false
+                        }
+                    };
+                    if !matching_type {
+                        continue;
+                    }
+                    out.call_parameter_names.push(CallArgumentNameReport::new(
+                        CandidateInput {
+                            original_proto_type: message.name.clone(),
+                            original_proto_field: field.name.clone(),
+                            proto_kind: field.kind.clone(),
+                            native_bytes: *bytes,
+                            callee_signature: factory.signature.clone(),
+                            parameter_name: parameter_name.clone(),
+                            parameter_index: argument.argument_index,
+                        },
+                        Some(TypeBoundEvidence {
+                            caller_signature: signature.clone(),
+                            caller_rva: rva,
+                            callee_rva: argument.target_rva,
+                            call_rva: argument.call_rva,
+                            load_sites: vec![argument.load_rva],
+                            proto_offset: field.offset,
+                            actual_parameter_type: type_name.clone(),
+                            actual_return_type: factory.return_name.clone(),
+                            return_abi: "managed-reference".to_owned(),
+                            abi_argument_index: argument.argument_index,
+                            abi_location: ArgumentLocation::Register {
+                                name: ["RCX", "RDX", "R8", "R9"][argument.argument_index]
+                                    .to_owned(),
+                            },
+                        }),
+                    ));
+                }
+            }
+            if scans.iter().all(|(_, scan)| {
+                scan.copies.is_empty()
+                    && !scan.call_arguments.iter().any(|argument| {
+                        argument.receiver_is_business && argument.argument_index == 1
+                    })
+            }) {
+                decision.stage = "native-copy".to_owned();
+                decision.reason = "no-supported-native-copy".to_owned();
                 return Ok(());
             }
             if !accessors.contains_key(&owner) {
-                let found = out.accessors(owner, cache, image, &bounds)?;
+                decision.stage = "property-discovery".to_owned();
+                let found = out.accessors(owner, signature, cache, image, &bounds)?;
                 accessors.insert(owner, found);
             }
             let business_type = checked_name(owner.get_full_name()?)?;
             let business = &accessors[&owner];
+            let mut copies = Vec::new();
+            for (bytes, mut scan) in scans {
+                scan.bind_setter_calls(bytes, |target| {
+                    let mut matches = business.iter().filter(|property| {
+                        property.member_kind == "property" && property.setter_rva == target
+                    });
+                    let first = matches.next()?;
+                    // Shared native bodies do not identify a property unless
+                    // current metadata binds the call to one own member.
+                    matches
+                        .next()
+                        .is_none()
+                        .then_some((first.offset, first.bytes))
+                });
+                copies.extend(scan.copies.into_iter().map(|copy| (bytes, copy)));
+            }
+            out.copies += copies.len();
+            out.setter_call_copies += copies.iter().filter(|(_, copy)| copy.setter_call).count();
+            decision.copies = copies.len();
+            decision.setter_call_copies =
+                copies.iter().filter(|(_, copy)| copy.setter_call).count();
             let mut offsets = HashMap::<u32, usize>::new();
             for field in message
                 .fields
@@ -930,20 +1545,24 @@ fn collect_inner(
                 *offsets.entry(field.offset).or_default() += 1;
             }
             for (bytes, copy) in copies {
+                decision.stage = "proto-field-binding".to_owned();
                 let Some(field) = message.fields.iter().find(|field| {
                     field.offset == copy.proto_offset
                         && offsets[&field.offset] == 1
                         && wire_bytes(&field.kind, &enum_names) == Some(bytes)
                         && is_obf(&field.name)
                 }) else {
+                    decision.reason = "copy-does-not-bind-unique-obfuscated-proto-field".to_owned();
                     continue;
                 };
+                decision.stage = "business-property-binding".to_owned();
                 let Some(property) = business.iter().find(|a| {
                     a.offset == copy.business_offset
                         && a.bytes == bytes
                         && (compatible_kind(&a.kind, &field.kind)
                             || matches!(a.kind.as_str(), "enum" | "reference"))
                 }) else {
+                    decision.reason = "no-typed-business-member-at-copy-offset".to_owned();
                     continue;
                 };
                 // Equal copy width is insufficient for enums and references.
@@ -951,8 +1570,14 @@ fn collect_inner(
                 // type; different business enums or collection shapes reject.
                 match same_proto_property(proto, &field.name, property.ty) {
                     Ok(true) => {}
-                    Ok(false) => continue,
+                    Ok(false) => {
+                        decision.stage = "type-binding".to_owned();
+                        decision.reason = "proto-property-type-mismatch".to_owned();
+                        continue;
+                    }
                     Err(error) => {
+                        decision.stage = "type-binding".to_owned();
+                        decision.reason = format!("proto-property-type-error: {error:#}");
                         out.failure(format_args!(
                             "Proto property={} tag={}: {error:#}",
                             field.name, field.number
@@ -970,9 +1595,25 @@ fn collect_inner(
                     business_offset: property.offset,
                     business_property_type: checked_name(property.ty.get_full_name()?)?,
                     business_member_kind: property.member_kind,
+                    business_property_name_proof: property.name_proof.clone(),
                     kind: field.kind.clone(),
                     native_bytes: bytes,
+                    copy_binding: if copy.setter_call {
+                        "typed-instance-setter-call"
+                    } else {
+                        "direct-instance-store"
+                    },
                     sync_method: name.clone(),
+                    sync_signature: signature.clone(),
+                    method_binding: if constructor {
+                        "native-constructor"
+                    } else {
+                        "reflection-method"
+                    },
+                    managed_parameter_count: parameter_count,
+                    proto_parameter_index: proto_index,
+                    proto_argument_register: proto_register,
+                    parameter_types: decision.parameter_types.clone(),
                     sync_return_type: return_name.clone(),
                     return_abi,
                     sync_rva: rva,
@@ -983,36 +1624,69 @@ fn collect_inner(
                     status: "candidate",
                     final_name: None,
                 });
+                decision.stage = "evidence".to_owned();
+                decision.reason = "copy-property-and-type-binding-proven".to_owned();
+                decision.new_evidence += 1;
             }
             Ok(())
         })();
         if let Err(error) = result {
+            decision.reason = format!("error: {error:#}");
+            if decision.stage == "not-processed" {
+                decision.stage = "method-binding".to_owned();
+            }
             out.failure(format_args!("{error:#}"));
         }
+        decision.new_evidence = out.evidence.len().saturating_sub(evidence_before);
+        if decision.reason == "not-processed" {
+            decision.reason = "rejected-at-current-stage".to_owned();
+        }
+        out.methods_decisions.push(decision);
     }
     out.owners = accessors.len();
+    log::info!(
+        "[Sync Call Names] complete: factory_targets={} shared_factory_targets={} typed_parameter_rows={} metadata_errors={} setter_call_copies={} proven_tail_exits={} unsupported_tail_callers={}; parameter names are diagnostic candidates only",
+        factory_cache.len(),
+        out.shared_factory_targets,
+        out.call_parameter_names.len(),
+        out.call_metadata_errors,
+        out.setter_call_copies,
+        out.proven_tail_exits,
+        out.unsupported_tail_callers
+    );
     if let Some(flow) = flow {
         out.control_flow = flow.stats;
     }
     log::info!(
-        "[Sync Flow] complete: examined={} proven={} cache_hits={} terminal_calls={} catch_edges={} unsupported_callers={} errors={}",
+        "[Sync Flow] complete: examined={} proven={} cache_hits={} terminal_calls={} catch_edges={} switch_dispatches={} switch_targets={} unsupported_callers={} errors={}",
         out.control_flow.functions_examined,
         out.control_flow.proven_functions,
         out.control_flow.cache_hits,
         out.control_flow.terminal_calls,
         out.control_flow.exceptional_edges,
+        out.control_flow.switch_dispatches,
+        out.control_flow.switch_targets,
         out.control_flow.unsupported_callers,
         out.control_flow_errors
     );
     log::info!(
-        "[Sync Fields] candidates: methods={} sync_methods={} specialized_sync_methods={} other_proto_methods={} unsupported_returns={} owners={} accessors={} copies={} tags={} conflicts={} metadata_errors={}",
+        "[Sync Fields] property names: obfuscated_metadata={} bound_accessor_names={}",
+        out.obfuscated_property_names,
+        out.accessor_named_properties
+    );
+    log::info!(
+        "[Sync Fields] candidates: methods={} sync_methods={} specialized_sync_methods={} other_proto_methods={} reference_returns={} multi_parameter_methods={} shifted_proto_methods={} unsupported_returns={} owners={} members={} declared_fields={} copies={} tags={} conflicts={} metadata_errors={}",
         out.methods_considered,
         out.sync_methods,
         out.specialized_sync_methods,
         out.other_proto_methods,
+        out.reference_return_methods,
+        out.multi_parameter_methods,
+        out.shifted_proto_methods,
         out.unsupported_return_types,
         out.owners,
         out.typed_accessors,
+        out.declared_fields,
         out.copies,
         out.names.values().map(HashMap::len).sum::<usize>(),
         out.conflicts,
@@ -1063,7 +1737,6 @@ mod tests {
         for signature in [
             "Business::.ctor(ABCDEFGHIJK)",
             "Business::Update(KLMNOPQRSTU)",
-            "Business::Update(ABCDEFGHIJK,System.Int32)",
             "Business::Update(ABCDEFGHIJK[])",
             "Business::Update(List<ABCDEFGHIJK>)",
             "Business::Update(ABCDEFGHIJK)",
@@ -1073,6 +1746,26 @@ mod tests {
         }
         assert!(!proto_signature("Update(ABCDEFGHIJK)", &names));
         assert!(!proto_signature("Business::Update(ABCDEFGHIJK", &names));
+        assert!(proto_signature(
+            "Business::Update(ABCDEFGHIJK,System.Int32)",
+            &names
+        ));
+        assert!(constructor_signature(
+            "Business::.ctor(Proto.ABCDEFGHIJK)",
+            &names
+        ));
+        assert!(constructor_signature(
+            "Business::.ctor(ABCDEFGHIJK)",
+            &names
+        ));
+        for signature in [
+            "Business::.cctor(ABCDEFGHIJK)",
+            "Business::.ctor(ABCDEFGHIJK,System.Int32)",
+            "Business::.ctor(ABCDEFGHIJK[])",
+            "Business::.ctor(KLMNOPQRSTU)",
+        ] {
+            assert!(!constructor_signature(signature, &names), "{signature}");
+        }
     }
 
     #[test]
@@ -1126,6 +1819,31 @@ mod tests {
         assert!(!sync_return_abi("System.Object", Some(&CachedType::Object)));
     }
 
+    #[test]
+    fn actual_parameter_binding_rejects_ambiguity_and_unmodeled_abis() {
+        use ParameterAbi::*;
+        assert_eq!(parameter_slot(&[ProtoMessage]), Ok(0));
+        assert_eq!(parameter_slot(&[Scalar, ProtoMessage, Scalar]), Ok(1));
+        assert_eq!(parameter_slot(&[Scalar, Scalar, ProtoMessage]), Ok(2));
+        // Total length comes from metadata; trailing scalar stack args do not
+        // shift the already modeled Proto register.
+        assert_eq!(
+            parameter_slot(&[ProtoMessage, Scalar, Scalar, Scalar, Scalar]),
+            Ok(0)
+        );
+        assert!(parameter_slot(&[]).is_err());
+        assert!(parameter_slot(&[Scalar]).is_err());
+        assert!(parameter_slot(&[ProtoMessage, ProtoMessage]).is_err());
+        assert!(parameter_slot(&[Scalar, Scalar, Scalar, ProtoMessage]).is_err());
+        assert!(parameter_slot(&[ProtoMessage, Unsupported]).is_err());
+        assert!(parameter_slot(&[Unsupported, ProtoMessage]).is_err());
+        assert!(scalar_parameter(Some(&CachedType::Single)));
+        assert!(scalar_parameter(Some(&CachedType::Int64)));
+        assert!(!scalar_parameter(Some(&CachedType::Enum)));
+        assert!(!scalar_parameter(Some(&CachedType::Object)));
+        assert!(!scalar_parameter(None));
+    }
+
     fn evidence(message: &str, recovered: &str) -> Evidence {
         Evidence {
             message: message.into(),
@@ -1137,9 +1855,17 @@ mod tests {
             business_offset: 48,
             business_property_type: "System.UInt32".into(),
             business_member_kind: "property",
+            business_property_name_proof: None,
             kind: "uint32".into(),
             native_bytes: 4,
+            copy_binding: "direct-instance-store",
             sync_method: "Sync".into(),
+            sync_signature: format!("Business::Sync({message})"),
+            method_binding: "reflection-method",
+            managed_parameter_count: 1,
+            proto_parameter_index: 0,
+            proto_argument_register: "RDX",
+            parameter_types: vec![ParameterProof::proto(0, message.into())],
             sync_return_type: "System.Void".into(),
             return_abi: "void",
             sync_rva: 1,

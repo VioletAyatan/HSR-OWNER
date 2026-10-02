@@ -17,6 +17,7 @@ use utils::game_assembly_slice;
 
 mod asm_address;
 mod cache;
+mod call_argument_names;
 mod field_metadata;
 pub mod handler_nt;
 mod logic_nt;
@@ -26,6 +27,7 @@ mod names;
 mod native_flow;
 mod native_pe;
 mod native_switch;
+mod native_tail;
 mod nt;
 mod output;
 mod proto_asm_parser;
@@ -716,11 +718,17 @@ fn dump_inner<W: Write>(
     };
 
     progress.stage("global field names", 0);
-    let mut proto_field_map = method_nt::dump_global_field_map();
+    let mut proto_field_map = method_nt::dump_global_field_map()?;
     proto_field_map.insert("retcode".into(), "retcode".into());
     progress.stage("handler field names", type_to_item.len());
     for (k, v) in handler_nt::get_handler_nt_map(&type_to_item, &method_nt_map, &cs_handler_table) {
         proto_field_map.entry(k).or_insert(v);
+    }
+    let mut gateway_names = handler_nt::handler::gate_server::process_all(&type_to_item);
+    for (k, v) in &gateway_names.global {
+        proto_field_map
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
     }
 
     progress.stage("message field metadata", type_to_item.len());
@@ -738,6 +746,25 @@ fn dump_inner<W: Write>(
     // output policy. Validate that baseline first so rejected collisions still
     // remain eligible for a unique native-copy name.
     progress.stage("preserve existing field names", minimal_info_map.len());
+    let (_, _, before_gateway) = output::generate_protobuf(
+        &type_cache,
+        &minimal_info_map,
+        &rsp_notify_map,
+        &req_map,
+        rsp_notify_names,
+        &logic_names.types,
+        &logic_names.fields,
+        &field_metadata.names,
+        std::io::sink(),
+    )?;
+    gateway_names.retain_unresolved(&before_gateway);
+    drop(before_gateway);
+    for (message, fields) in &gateway_names.scoped {
+        let scoped = field_metadata.names.entry(message.clone()).or_default();
+        for (&tag, name) in fields {
+            scoped.entry(tag).or_insert_with(|| name.clone());
+        }
+    }
     let (_, _, baseline_items) = output::generate_protobuf(
         &type_cache,
         &minimal_info_map,
@@ -777,6 +804,7 @@ fn dump_inner<W: Write>(
         &final_items,
         std::path::Path::new("./DUMP/proto-sync-field-evidence.json"),
     )?;
+    gateway_names.write(&final_items)?;
 
     names::rename_handler_keys(&mut cs_type_infos, &nt_map_final);
     names::rename_handler_keys(&mut sc_packet_handlers, &nt_map_final);
