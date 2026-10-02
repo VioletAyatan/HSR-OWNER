@@ -1714,6 +1714,7 @@ dependencies = [
  "log",
  "microseh",
  "prost",
+ "protox",
  "reflection",
  "serde",
  "serde_json",

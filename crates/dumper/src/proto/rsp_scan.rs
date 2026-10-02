@@ -50,12 +50,20 @@ impl<'a> FunctionTable<'a> {
         let records = image
             .get(rva..rva.checked_add(size).context("function table overflow")?)
             .context("runtime function table outside image")?;
+        Self::from_records(records, image.len())
+    }
+
+    pub(super) fn from_records(records: &'a [u8], image_len: usize) -> Result<Self> {
+        ensure!(
+            !records.is_empty() && records.len() % 12 == 0,
+            "invalid runtime function records"
+        );
         let table = Self { records };
         let mut previous = 0;
         for index in 0..records.len() / 12 {
             let range = table.record(index);
             ensure!(
-                range.start >= previous && range.start < range.end && range.end <= image.len(),
+                range.start >= previous && range.start < range.end && range.end <= image_len,
                 "invalid runtime function range {index}"
             );
             previous = range.start;
@@ -129,6 +137,28 @@ pub(super) fn scan(
     image_len: usize,
     slots: &HashSet<usize>,
 ) -> ScanResult {
+    scan_impl(code, ip, base, image_len, slots, true)
+}
+
+// Enum array accessors must not bind to the first of several class checks.
+pub(super) fn scan_unique(
+    code: &[u8],
+    ip: u64,
+    base: usize,
+    image_len: usize,
+    slots: &HashSet<usize>,
+) -> ScanResult {
+    scan_impl(code, ip, base, image_len, slots, false)
+}
+
+fn scan_impl(
+    code: &[u8],
+    ip: u64,
+    base: usize,
+    image_len: usize,
+    slots: &HashSet<usize>,
+    first_match: bool,
+) -> ScanResult {
     let mut result = ScanResult {
         slot: None,
         decoded: 0,
@@ -157,8 +187,14 @@ pub(super) fn scan(
                 if let (Some(Value::Class), Some(Value::TypeInfo(rva)))
                 | (Some(Value::TypeInfo(rva)), Some(Value::Class)) = (left, right)
                 {
+                    if result.slot.is_some_and(|previous| previous != rva) {
+                        result.slot = None;
+                        return result;
+                    }
                     result.slot = Some(rva);
-                    return result;
+                    if first_match {
+                        return result;
+                    }
                 }
             }
             let assigned = (instruction.mnemonic() == Mnemonic::Mov
@@ -265,6 +301,31 @@ mod tests {
         let looped = analyze(&[0xeb, 0xfe], &[]);
         assert!(looped.slot.is_none() && looped.decoded == 1);
         assert_eq!(analyze(&[0xeb, 0x7f], &[]).slot, None);
+    }
+
+    #[test]
+    fn unique_type_binding_rejects_multiple_array_class_checks() {
+        // mov rax,[r8]; cmp rax,[rip+0xF6]; cmp rax,[rip+0xF7]; ret
+        let code = [
+            0x49, 0x8b, 0x00, 0x48, 0x3b, 0x05, 0xf6, 0, 0, 0, 0x48, 0x3b, 0x05, 0xf7, 0, 0, 0,
+            0xc3,
+        ];
+        assert_eq!(
+            scan_unique(&code, BASE as u64, BASE, 0x400, &HashSet::from([0x100])).slot,
+            Some(0x100)
+        );
+        assert_eq!(
+            scan_unique(
+                &code,
+                BASE as u64,
+                BASE,
+                0x400,
+                &HashSet::from([0x100, 0x108])
+            )
+            .slot,
+            None
+        );
+        assert_eq!(analyze(&code, &[0x100, 0x108]).slot, Some(0x100));
     }
 
     #[test]

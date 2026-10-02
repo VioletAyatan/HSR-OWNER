@@ -9,7 +9,7 @@ use windows::Win32::System::Memory::{
     VirtualQuery,
 };
 
-pub(super) fn readable(address: usize, length: usize) -> Result<()> {
+pub(crate) fn readable(address: usize, length: usize) -> Result<()> {
     ensure!(address != 0, "null memory address");
     let end = address
         .checked_add(length)

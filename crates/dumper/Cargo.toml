@@ -31,3 +31,6 @@ ureq.workspace = true
 byteorder.workspace = true
 prost.workspace = true
 cc.workspace = true
+
+[dev-dependencies]
+protox.workspace = true

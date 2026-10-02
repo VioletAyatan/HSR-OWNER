@@ -173,13 +173,26 @@ impl RuntimeType {
         }
     }
 
+    pub fn get_properties_array(&self, binding_flags: i32) -> Result<Il2CppArray> {
+        self.get_properties_internal(binding_flags)
+    }
+
     #[inline]
     pub fn get_fields(&self, binding_flags: i32) -> Vec<FieldInfo> {
+        self.get_fields_checked(binding_flags).unwrap_or_default()
+    }
+
+    #[inline]
+    pub fn get_fields_checked(&self, binding_flags: i32) -> Result<Vec<FieldInfo>> {
         unsafe {
             self.get_fields_internal(binding_flags)
                 .map(il2cpp::api::Il2CppArray::to_vec::<FieldInfo>)
-                .unwrap_or_default()
         }
+    }
+
+    #[inline]
+    pub fn get_fields_array(&self, binding_flags: i32) -> Result<Il2CppArray> {
+        self.get_fields_internal(binding_flags)
     }
 
     #[inline]

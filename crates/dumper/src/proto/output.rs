@@ -7,6 +7,8 @@ use indexmap::IndexMap;
 use reflection::runtime_type::RuntimeType;
 use std::{borrow::Cow, cell::RefCell, collections::HashMap, io::Write, rc::Rc};
 
+pub(super) use super::names::{apply_global_field_map, apply_type_names, rename_packet_ids};
+
 pub type TypeToItemMap = IndexMap<RuntimeType, Rc<RefCell<ProtoItem>>>;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -100,7 +102,7 @@ impl Message {
                 && self
                     .oneofs
                     .iter()
-                    .any(|v| v.fields.len() == en.variants.len() - 1)
+                    .any(|v| v.fields.len() == en.variants.len().saturating_sub(1))
             {
                 continue; // Skip enum for oneof
             }
@@ -109,11 +111,7 @@ impl Message {
         }
 
         for field in &self.fields {
-            let field_display_name = if field.name == *RETCODE_FIELD_NAME {
-                "retcode".to_string()
-            } else {
-                snake_field(&field.name)
-            };
+            let field_display_name = snake_field(&field.name);
 
             result.push_str(&format!(
                 "{}\t{} {} = {}; // offset: {}\n",
@@ -133,11 +131,7 @@ impl Message {
             ));
 
             for field in &oneof.fields {
-                let field_display_name = if field.name == *RETCODE_FIELD_NAME {
-                    "retcode".to_string()
-                } else {
-                    snake_field(&field.name)
-                };
+                let field_display_name = snake_field(&field.name);
 
                 if field.offset != 0 {
                     result.push_str(&format!(
@@ -223,13 +217,13 @@ pub fn snake_field(input: &str) -> String {
 }
 
 pub fn remove_namespace(s: &str) -> String {
-    let parts: Vec<&str> = s.split('.').collect();
-
-    if parts.len() > 1 {
-        parts[1..].join(".")
-    } else {
-        s.to_string()
-    }
+    super::names::map_kind(s, |token| {
+        token
+            .strip_prefix("Proto.")
+            .or_else(|| token.strip_prefix("proto."))
+            .unwrap_or(token)
+            .to_owned()
+    })
 }
 
 pub fn remove_repeated_map(s: &str) -> String {
@@ -308,33 +302,6 @@ fn process_cmd_id(
         if let ProtoItem::Message(message) = &mut *proto_message.borrow_mut() {
             if let Some(deobf_name) = method_nt_map.get(short_name(&message.name)) {
                 message.deobfuscated_name = Some(deobf_name.to_string());
-            }
-
-            for field in &mut message.fields {
-                let name = remove_repeated_map(&field.kind);
-
-                if let Some(nt_name) = nt_map.get(&name).or_else(|| nt_map.get(short_name(&name))) {
-                    field.kind = field.kind.replace(&name, nt_name);
-                }
-
-                if let Some(nted) = method_nt_map
-                    .get(&name)
-                    .or_else(|| method_nt_map.get(short_name(&name)))
-                {
-                    field.kind = field.kind.replace(&name, nted);
-                }
-            }
-
-            for oneof in &mut message.oneofs {
-                for field in &mut oneof.fields {
-                    let name = remove_repeated_map(&field.kind);
-
-                    if let Some(nt_name) =
-                        nt_map.get(&name).or_else(|| nt_map.get(short_name(&name)))
-                    {
-                        field.kind = field.kind.replace(&name, nt_name);
-                    }
-                }
             }
 
             if let Some((cmd_id, deobf_name)) = req_map.get(&message.name) {
@@ -519,8 +486,9 @@ pub fn generate_protobuf<W: Write>(
     rsp_notify_names: &HashMap<String, String>,
     method_nt_map: &HashMap<String, String>,
     predeobf_map: &HashMap<String, String>,
+    scoped_field_names: &super::names::ScopedFieldNames,
     mut out: W,
-) -> (HashMap<i32, String>, HashMap<String, String>, TypeToItemMap) {
+) -> std::io::Result<(HashMap<i32, String>, HashMap<String, String>, TypeToItemMap)> {
     let mut type_to_item: TypeToItemMap = IndexMap::new();
 
     for i in unsafe { il2cpp::RPG_NETWORK_PROTO_START..il2cpp::RPG_NETWORK_PROTO_END } {
@@ -775,7 +743,7 @@ pub fn generate_protobuf<W: Write>(
         }
     }
 
-    let (cmd_ids, nt_map) = process_cmd_id(
+    let (mut cmd_ids, nt_map) = process_cmd_id(
         &mut type_to_item,
         &rsp_notify_map
             .iter()
@@ -794,14 +762,21 @@ pub fn generate_protobuf<W: Write>(
         method_nt_map,
     );
 
-    apply_global_field_map(&mut type_to_item, predeobf_map);
+    let accepted_types = apply_type_names(&mut type_to_item, &nt_map);
+    let mut field_names = predeobf_map.clone();
+    field_names.insert(RETCODE_FIELD_NAME.to_string(), "retcode".into());
+    if scoped_field_names.is_empty() {
+        apply_global_field_map(&mut type_to_item, &field_names);
+    } else {
+        super::names::apply_field_maps(&mut type_to_item, &field_names, scoped_field_names);
+    }
+    rename_packet_ids(&mut cmd_ids, &accepted_types);
 
     writeln!(
         out,
         "syntax = \"proto3\"; // ex-RushiaLover ProtoDumper | Game Version: {}\n",
         *crate::version::GAME_VERSION
-    )
-    .unwrap();
+    )?;
 
     for proto in type_to_item.values() {
         let proto = proto.borrow();
@@ -817,25 +792,8 @@ pub fn generate_protobuf<W: Write>(
                 }
             }
         }
-        writeln!(out, "{}", proto.fmt_protobuf_with_depth(0)).unwrap();
+        writeln!(out, "{}", proto.fmt_protobuf_with_depth(0))?;
     }
 
-    (cmd_ids, nt_map, type_to_item)
-}
-
-pub fn apply_global_field_map(type_to_item: &mut TypeToItemMap, map: &HashMap<String, String>) {
-    if map.is_empty() {
-        return;
-    }
-
-    for item in type_to_item.values_mut() {
-        let mut item_mut = item.borrow_mut();
-        if let ProtoItem::Message(msg) = &mut *item_mut {
-            for field in &mut msg.fields {
-                if let Some(deobf) = map.get(&field.name) {
-                    field.name = deobf.clone();
-                }
-            }
-        }
-    }
+    Ok((cmd_ids, accepted_types, type_to_item))
 }

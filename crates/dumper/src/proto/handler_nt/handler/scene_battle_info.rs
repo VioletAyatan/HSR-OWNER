@@ -7,12 +7,12 @@ use utils::game_assembly_slice;
 
 use super::build_game_offset_map;
 
-pub fn process(type_to_item: &TypeToItemMap) -> HashMap<String, String> {
+pub fn process(
+    type_to_item: &TypeToItemMap,
+    method_nt_map: &HashMap<String, String>,
+) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
-    let Some(method_nt_map) = crate::proto::method_nt::CACHED_NT_MAP.get() else {
-        return map;
-    };
     let scene_battle_obf = method_nt_map
         .iter()
         .find_map(|(obf, deobf)| (deobf == "SceneBattleInfo").then(|| obf.clone()));

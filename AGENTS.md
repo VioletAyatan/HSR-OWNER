@@ -17,7 +17,7 @@
 ## 当前状态与入口
 
 - Resources 修复已通过游戏内流程验收并提交；Proto/WriteTo 的卡住、崩溃修复也已通过一次完整流程验证，不再作为待排查问题。
-- 当前未解决：导出的 GateServer 存在字段重名，导致 protobuf 解析失败。继续此项时读 [Proto 当前问题](docs/Proto排查工作流与交接.md)。
+- Proto 名称输出链、GateServer 字段冲突、XLua 枚举与业务 Sync 整数字段恢复（含 SSE、Sync 后缀方法、已证非返回调用及支持的 FH3 异常续接）已通过 WriteTo 运行导出及产物解析；剩余混淆名、其他异常与复制形态、模板语义仍需核实。继续此项时读 [Proto 当前问题](docs/Proto排查工作流与交接.md)。
 - 本机游戏目录：`D:/StarRail_Beta`；日志：`hsr-owner.log`；导出目录：`DUMP`。
 
 ## 文档维护

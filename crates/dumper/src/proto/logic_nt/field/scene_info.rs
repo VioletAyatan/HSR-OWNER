@@ -48,7 +48,13 @@ pub fn full_deobf_scene_info(
         }
     }
 
-    let (game_mode_field, world_field) = if xref_names.contains(&scene_info_fields[0]) {
+    let first_shared = xref_names.contains(&scene_info_fields[0]);
+    let second_shared = xref_names.contains(&scene_info_fields[1]);
+    if first_shared == second_shared {
+        log::debug!("[Logic NT] SceneInfo: game_mode_type/world_id cross-reference is ambiguous");
+        return;
+    }
+    let (game_mode_field, world_field) = if first_shared {
         (&scene_info_fields[0], &scene_info_fields[1])
     } else {
         (&scene_info_fields[1], &scene_info_fields[0])

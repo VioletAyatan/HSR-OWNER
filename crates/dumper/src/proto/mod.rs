@@ -17,17 +17,29 @@ use utils::game_assembly_slice;
 
 mod asm_address;
 mod cache;
+mod field_metadata;
 pub mod handler_nt;
 mod logic_nt;
 mod merge_from;
 mod method_nt;
+mod names;
+mod native_flow;
+mod native_pe;
+mod native_switch;
 mod nt;
 mod output;
 mod proto_asm_parser;
 mod proto_stream;
+#[cfg(test)]
+mod replay_tests;
 mod rsp_scan;
+mod sync_fields;
+mod sync_scan;
 pub mod util;
 mod write_to;
+mod xlua_enum;
+#[cfg(test)]
+mod xlua_enum_replay;
 
 static IL2CPP_OBJECT_NEW_API_RVA: LazyLock<usize> = LazyLock::new(|| unsafe {
     let api_ptr_addr = (*il2cpp::API_BASE_PTR) + 8 * 130;
@@ -572,10 +584,10 @@ fn dump_inner<W: Write>(
         nt::collect_rsp_notify_mappings(&minimal_info_map, progress).map_err(io::Error::other)?;
     let rsp_notify_names = &response_mappings.names;
     progress.stage("method handler names", 0);
-    let (method_handler_map, method_nt_map) = method_nt::get_method_nt_map();
+    let (method_handler_map, method_nt_map) = method_nt::get_method_nt_map()?;
 
     progress.stage("prepare message names", minimal_info_map.len());
-    let (cmd_ids, proto_name_map, type_to_item) = output::generate_protobuf(
+    let (_, proto_name_map, type_to_item) = output::generate_protobuf(
         &type_cache,
         &minimal_info_map,
         &rsp_notify_map,
@@ -583,12 +595,11 @@ fn dump_inner<W: Write>(
         rsp_notify_names,
         &method_nt_map,
         &HashMap::new(),
+        &HashMap::new(),
         std::io::sink(),
-    );
+    )?;
 
-    let mut req_rsp_enum_nt = proto_name_map.clone();
-
-    let cs_type_infos = {
+    let (mut cs_type_infos, cs_handler_table) = {
         let mut result_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut table_entries: Vec<(String, String, usize)> = Vec::new();
 
@@ -609,7 +620,7 @@ fn dump_inner<W: Write>(
                 .get(&formatted_name)
                 .cloned()
                 .unwrap_or_else(|| formatted_name.clone());
-            result_map.insert(deobf_name.clone(), valid_rvas.clone());
+            result_map.insert(obf_name.clone(), valid_rvas.clone());
 
             for rva_str in &valid_rvas {
                 if let Ok(rva) = usize::from_str_radix(rva_str.trim_start_matches("0x"), 16) {
@@ -618,12 +629,10 @@ fn dump_inner<W: Write>(
             }
         }
 
-        let _ = crate::proto::handler_nt::CS_HANDLER_TABLE.set(table_entries);
-
-        result_map
+        (result_map, table_entries)
     };
 
-    let sc_packet_handlers = {
+    let mut sc_packet_handlers = {
         progress.stage("response handler addresses", 0);
         let mut method_map: HashMap<RuntimeType, Vec<String>> = HashMap::new();
         let mut proto_param_map: HashMap<RuntimeType, Vec<String>> = HashMap::new();
@@ -668,24 +677,16 @@ fn dump_inner<W: Write>(
         let mut result_map: HashMap<String, Vec<String>> = HashMap::new();
         for rt in rsp_notify_map.keys() {
             if let Some(handlers) = method_map.get(rt) {
-                let formatted_name = rt.format_type_name(true);
-                let key = rsp_notify_names
-                    .get(&formatted_name)
-                    .cloned()
-                    .unwrap_or_else(|| rt.il_name().into_owned());
-
-                result_map.insert(key, handlers.clone());
+                result_map.insert(rt.il_name().into_owned(), handlers.clone());
             }
         }
         for (formatted_name, cmd_rvas) in rsp_notify_method_rvas {
             for cmd_rva in cmd_rvas {
                 if cmd_rva != "0x0" {
-                    let key = rsp_notify_names
-                        .get(formatted_name)
-                        .cloned()
-                        .unwrap_or(formatted_name.clone());
-
-                    result_map.entry(key).or_default().push(cmd_rva.clone());
+                    result_map
+                        .entry(formatted_name.clone())
+                        .or_default()
+                        .push(cmd_rva.clone());
                 }
             }
         }
@@ -693,18 +694,22 @@ fn dump_inner<W: Write>(
         for (rt, handlers) in proto_param_map {
             let il_name = rt.il_name();
             if il_name.len() == 11 && il_name.chars().all(|c| c.is_ascii_uppercase()) {
-                let formatted_name = rt.format_type_name(true);
-                let key = rsp_notify_names
-                    .get(&formatted_name)
-                    .cloned()
-                    .unwrap_or_else(|| il_name.into_owned());
-
-                result_map.entry(key).or_default().extend(handlers);
+                result_map
+                    .entry(il_name.into_owned())
+                    .or_default()
+                    .extend(handlers);
             }
         }
 
         for (key, handlers) in method_handler_map {
-            result_map.entry(key).or_default().extend(handlers);
+            let mut originals = method_nt_map.iter().filter(|(_, name)| **name == key);
+            let original = originals.next();
+            let raw_key = if originals.next().is_none() {
+                original.map(|(raw, _)| raw.clone()).unwrap_or(key)
+            } else {
+                key
+            };
+            result_map.entry(raw_key).or_default().extend(handlers);
         }
 
         result_map
@@ -712,50 +717,78 @@ fn dump_inner<W: Write>(
 
     progress.stage("global field names", 0);
     let mut proto_field_map = method_nt::dump_global_field_map();
+    proto_field_map.insert("retcode".into(), "retcode".into());
     progress.stage("handler field names", type_to_item.len());
-    for (k, v) in handler_nt::get_handler_nt_map(&type_to_item) {
+    for (k, v) in handler_nt::get_handler_nt_map(&type_to_item, &method_nt_map, &cs_handler_table) {
         proto_field_map.entry(k).or_insert(v);
     }
 
-    let logic_field_map = proto_field_map.clone();
+    progress.stage("message field metadata", type_to_item.len());
+    let mut field_metadata = field_metadata::collect(&type_to_item, &type_cache, progress)?;
+    let mut sync_fields = sync_fields::collect(&type_to_item, &type_cache, progress)?;
 
     progress.stage("logic field names", type_to_item.len());
-    logic_nt::run_logic_nt(
+    let logic_names = logic_nt::run_logic_nt(
         &type_to_item.values().cloned().collect::<Vec<_>>(),
         &proto_name_map,
-        &logic_field_map,
-    );
-
-    progress.stage("write handler metadata", 0);
-    std::fs::write(
-        "./DUMP/cs-type-infos.json",
-        serde_json::to_string_pretty(&cs_type_infos)?,
+        &proto_field_map,
     )?;
 
-    std::fs::write(
-        "./DUMP/sc-packet-handlers.json",
-        serde_json::to_string_pretty(&sc_packet_handlers)?,
-    )?;
-
-    log::debug!("[Proto Dumper] generating protobuf...");
-    progress.stage("write protobuf", minimal_info_map.len());
-
-    let (cmd_ids_final, nt_map_final, _type_to_item) = output::generate_protobuf(
+    // Business aliases must not replace names already accepted by the existing
+    // output policy. Validate that baseline first so rejected collisions still
+    // remain eligible for a unique native-copy name.
+    progress.stage("preserve existing field names", minimal_info_map.len());
+    let (_, _, baseline_items) = output::generate_protobuf(
         &type_cache,
         &minimal_info_map,
         &rsp_notify_map,
         &req_map,
         rsp_notify_names,
-        &method_nt_map,
-        &proto_field_map,
-        out,
-    );
+        &logic_names.types,
+        &logic_names.fields,
+        &field_metadata.names,
+        std::io::sink(),
+    )?;
+    sync_fields.retain_unresolved(&baseline_items);
+    sync_fields.merge_into(&mut field_metadata.names);
+    drop(baseline_items);
 
-    for (obf_name, deobf_name) in nt_map_final {
-        req_rsp_enum_nt
-            .entry(obf_name)
-            .or_insert_with(|| deobf_name);
-    }
+    log::debug!("[Proto Dumper] generating protobuf...");
+    progress.stage("write protobuf", minimal_info_map.len());
+
+    let (cmd_ids_final, nt_map_final, final_items) = output::generate_protobuf(
+        &type_cache,
+        &minimal_info_map,
+        &rsp_notify_map,
+        &req_map,
+        rsp_notify_names,
+        &logic_names.types,
+        &logic_names.fields,
+        &field_metadata.names,
+        out,
+    )?;
+
+    progress.stage("write field name evidence", field_metadata.evidence.len());
+    field_metadata.write(
+        &final_items,
+        std::path::Path::new("./DUMP/proto-field-name-evidence.json"),
+    )?;
+    sync_fields.write(
+        &final_items,
+        std::path::Path::new("./DUMP/proto-sync-field-evidence.json"),
+    )?;
+
+    names::rename_handler_keys(&mut cs_type_infos, &nt_map_final);
+    names::rename_handler_keys(&mut sc_packet_handlers, &nt_map_final);
+    progress.stage("write handler metadata", 0);
+    std::fs::write(
+        "./DUMP/cs-type-infos.json",
+        serde_json::to_string_pretty(&cs_type_infos)?,
+    )?;
+    std::fs::write(
+        "./DUMP/sc-packet-handlers.json",
+        serde_json::to_string_pretty(&sc_packet_handlers)?,
+    )?;
 
     progress.stage("write packet IDs", 0);
     writeln!(

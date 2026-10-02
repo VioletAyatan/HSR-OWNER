@@ -12,13 +12,38 @@ use iced_x86::Register;
 use crate::proto::output::TypeToItemMap;
 
 pub fn process_all(type_to_item: &TypeToItemMap) -> HashMap<String, String> {
+    // A failed metadata lookup must not leave a previous dump's tag map active.
+    decode_gateway::set_proto_fields(HashMap::new());
     let mut map = parse_gate_server::process(type_to_item);
     map.extend(stop_info::process_stop_info(type_to_item));
     let decode_nt = decode_gateway::run();
-    for k in decode_nt.keys() {
-        map.remove(k);
+    let mut added = 0;
+    let mut conflicts = 0;
+    for (obf_name, inferred_name) in decode_nt {
+        match map.entry(obf_name) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(inferred_name);
+                added += 1;
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if entry.get() != &inferred_name {
+                    conflicts += 1;
+                    if conflicts <= 8 {
+                        log::warn!(
+                            "[Gateway] name conflict for {}: keeping direct code mapping {}, rejecting content candidate {}",
+                            entry.key(),
+                            entry.get(),
+                            inferred_name
+                        );
+                    }
+                }
+            }
+        }
     }
-    map.extend(decode_nt);
+    log::info!(
+        "[Gateway] name merge complete: total={}, content_added={added}, content_conflicts={conflicts}",
+        map.len()
+    );
     map
 }
 

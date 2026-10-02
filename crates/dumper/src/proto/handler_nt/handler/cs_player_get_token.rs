@@ -8,7 +8,10 @@ use crate::proto::output::{ProtoItem, TypeToItemMap};
 
 use super::build_game_offset_map;
 
-pub fn process(type_to_item: &TypeToItemMap) -> HashMap<String, String> {
+pub fn process(
+    type_to_item: &TypeToItemMap,
+    cs_handlers: &[(String, String, usize)],
+) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
     let result = il2cpp::get_cached_class("RPG.Client.RPGSDKAccountManager")
@@ -32,13 +35,9 @@ pub fn process(type_to_item: &TypeToItemMap) -> HashMap<String, String> {
         return map;
     };
 
-    let handler_entry = crate::proto::handler_nt::CS_HANDLER_TABLE
-        .get()
-        .and_then(|table| {
-            table
-                .iter()
-                .find(|(_, deobf, _)| deobf == "PlayerGetTokenCsReq")
-        });
+    let handler_entry = cs_handlers
+        .iter()
+        .find(|(_, deobf, _)| deobf == "PlayerGetTokenCsReq");
 
     let Some((obf_name, _, handler_rva)) = handler_entry else {
         log::debug!("[Handler NT] PlayerGetToken: not found in handler table");

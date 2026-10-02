@@ -50,6 +50,7 @@ pub fn deobf_fields(
         scene_info::SCENE_INFO_FIELD_MAP,
     ];
 
+    let mut ambiguous = HashSet::new();
     loop {
         let prev_map_size = global_field_map.len();
 
@@ -116,9 +117,9 @@ pub fn deobf_fields(
                                     .filter(|(mwt, _)| *mwt == wt)
                                     .collect();
 
-                                if fields_of_type.len() == names_of_type.len()
-                                    && !fields_of_type.is_empty()
-                                {
+                                // Equal counts do not establish which same-type field
+                                // has which meaning. Only a unique pair is evidence.
+                                if fields_of_type.len() == 1 && names_of_type.len() == 1 {
                                     for (f, (_, deobf_name)) in
                                         fields_of_type.iter().zip(names_of_type)
                                     {
@@ -126,6 +127,18 @@ pub fn deobf_fields(
                                         global_field_map.insert(f.name.clone(), deobf_s.clone());
                                         nt_map.insert(f.name.clone(), deobf_s);
                                     }
+                                } else if !fields_of_type.is_empty()
+                                    && !names_of_type.is_empty()
+                                    && ambiguous.insert((m.name.clone(), wt.to_string()))
+                                    && ambiguous.len() <= 12
+                                {
+                                    log::debug!(
+                                        "[Logic NT] ambiguous type match: message={} kind={} fields={} names={}",
+                                        m.name,
+                                        wt,
+                                        fields_of_type.len(),
+                                        names_of_type.len()
+                                    );
                                 }
                             }
                         }
@@ -140,6 +153,11 @@ pub fn deobf_fields(
     }
 
     scene_info::full_deobf_scene_info(items, nt_map, global_field_map);
+    log::info!(
+        "[Logic NT] field rules: recovered={} ambiguous_type_groups={}",
+        global_field_map.len(),
+        ambiguous.len()
+    );
 }
 
 fn deobf_kind(kind: &str, nt_map: &indexmap::IndexMap<String, String>) -> String {

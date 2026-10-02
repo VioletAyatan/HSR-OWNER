@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use std::io::{BufWriter, Write};
 
 mod init_calls;
-mod memory;
+pub(crate) mod memory;
 
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use il2cpp::{

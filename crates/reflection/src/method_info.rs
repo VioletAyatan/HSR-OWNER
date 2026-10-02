@@ -88,6 +88,10 @@ impl MethodInfo {
         }
     }
 
+    pub fn get_parameters_array(&self) -> anyhow::Result<Il2CppArray> {
+        self.get_parameters_internal()
+    }
+
     #[inline]
     pub fn get_il2cpp_method(&self) -> Il2CppMethod {
         unsafe { Il2CppMethod(*((self.0 + 0x10) as *const usize)) }
