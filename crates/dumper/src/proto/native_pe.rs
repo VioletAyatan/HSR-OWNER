@@ -17,6 +17,7 @@ struct Section {
     executable: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct Pe<'a> {
     image: &'a [u8],
     validator: Validator,

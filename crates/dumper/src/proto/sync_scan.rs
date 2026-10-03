@@ -154,6 +154,7 @@ enum Value {
     BusinessField(u32),
     SetterValue,
     Vector([Option<Lane>; 4]),
+    GprLanes([Option<Lane>; 2]),
 }
 type State = BTreeMap<Register, Value>;
 
@@ -164,8 +165,8 @@ fn pointer_value(value: &Value) -> bool {
     )
 }
 
-// A SIMD register contains four separate 32-bit lanes. Missing lanes include
-// zeroed bits: those bits are not evidence for another wire field.
+// SIMD and packed GPR values contain separate 32-bit lanes. Missing lanes
+// include zeroed bits: those bits are not evidence for another wire field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Lane {
     ProtoField { offset: u32, loads: BTreeSet<usize> },
@@ -333,15 +334,71 @@ fn vector_assignment(instruction: &Instruction, state: &State) -> Option<Value> 
     None
 }
 
-fn known_stores(instruction: &Instruction, state: &State, bytes: usize) -> Vec<(u32, Lane)> {
+fn gpr_copy_width(instruction: &Instruction) -> Option<usize> {
+    (instruction.encoding() == EncodingKind::Legacy
+        && instruction.mnemonic() == Mnemonic::Mov
+        && instruction.op_count() == 2
+        && !instruction.has_lock_prefix()
+        && !instruction.has_rep_prefix()
+        && !instruction.has_repne_prefix()
+        && (0..2).all(|index| match instruction.op_kind(index) {
+            OpKind::Register => instruction.op_register(index).is_gpr64(),
+            OpKind::Memory => instruction.memory_size().size() == 8,
+            _ => false,
+        }))
+    .then_some(8)
+}
+
+fn gpr_value_lanes(value: &Value) -> Option<[Option<Lane>; 2]> {
+    match value {
+        Value::GprLanes(lanes) => Some(lanes.clone()),
+        Value::ProtoField { .. } | Value::BusinessField(_) => {
+            // A dword scalar may have zero-extended upper bits, but those bits
+            // have no field provenance. Never split a pointer or setter input.
+            Some([lane(value.clone()), None])
+        }
+        _ => None,
+    }
+}
+
+fn gpr_operand(instruction: &Instruction, index: u32, state: &State) -> Option<[Option<Lane>; 2]> {
+    gpr_copy_width(instruction)?;
+    match instruction.op_kind(index) {
+        OpKind::Register => gpr_value_lanes(state.get(&instruction.op_register(index))?),
+        OpKind::Memory => {
+            // Reuse SIMD's exact complete-extent, owner and per-lane load proof.
+            let [low, high, _, _] = vector_operand(instruction, index, 8, state)?;
+            Some([low, high])
+        }
+        _ => None,
+    }
+}
+
+fn known_stores(
+    instruction: &Instruction,
+    state: &State,
+    bytes: usize,
+    packed_gpr: bool,
+) -> Vec<(u32, Lane)> {
     if instruction.mnemonic() == Mnemonic::Mov
         && instruction.op_count() == 2
         && instruction.op1_kind() == OpKind::Register
         && instruction.op1_register().size() == bytes
         && let Some((Value::BusinessPtr, offset)) = direct_offset(instruction, 0, state, bytes)
-        && let Some(value) = operand(instruction, 1, state, bytes).and_then(lane)
+        && let Some(value) = operand(instruction, 1, state, bytes, packed_gpr).and_then(lane)
     {
         return vec![(offset, value)];
+    }
+    if packed_gpr
+        && gpr_copy_width(instruction).is_some()
+        && let Some((Value::BusinessPtr, offset)) = direct_offset_width(instruction, 0, state, 8)
+        && let Some(lanes) = gpr_operand(instruction, 1, state)
+    {
+        return lanes
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.map(|value| (offset + index as u32 * 4, value)))
+            .collect();
     }
     if bytes == 4
         && let Some(vector_bytes) = vector_copy_width(instruction)
@@ -358,12 +415,43 @@ fn known_stores(instruction: &Instruction, state: &State, bytes: usize) -> Vec<(
     Vec::new()
 }
 
-fn operand(instruction: &Instruction, index: u32, state: &State, bytes: usize) -> Option<Value> {
+fn operand(
+    instruction: &Instruction,
+    index: u32,
+    state: &State,
+    bytes: usize,
+    packed_gpr: bool,
+) -> Option<Value> {
     match instruction.op_kind(index) {
         OpKind::Register => {
             let register = instruction.op_register(index);
             let value = state.get(&register.full_register())?;
             let width = register.size();
+            if let Value::GprLanes(lanes) = value {
+                if !packed_gpr
+                    || bytes != 4
+                    || instruction.encoding() != EncodingKind::Legacy
+                    || instruction.mnemonic() != Mnemonic::Mov
+                    || instruction.op_count() != 2
+                    || instruction.has_lock_prefix()
+                    || instruction.has_rep_prefix()
+                    || instruction.has_repne_prefix()
+                {
+                    return None;
+                }
+                return if register.is_gpr32() {
+                    // Writing a 32-bit GPR kills its high lane, even for EAX,EAX.
+                    match lanes[0].clone()? {
+                        Lane::ProtoField { offset, loads } => {
+                            Some(Value::ProtoField { offset, loads })
+                        }
+                        Lane::BusinessField(offset) => Some(Value::BusinessField(offset)),
+                        Lane::SetterValue => Some(Value::SetterValue),
+                    }
+                } else {
+                    register.is_gpr64().then(|| value.clone())
+                };
+            }
             let valid = match value {
                 Value::BusinessPtr
                 | Value::ProtoPtr
@@ -404,8 +492,9 @@ fn business_writes(
     state: &State,
     factory: &mut InstructionInfoFactory,
     bytes: usize,
+    packed_gpr: bool,
 ) -> Vec<BusinessWrite> {
-    let known_stores = known_stores(instruction, state, bytes);
+    let known_stores = known_stores(instruction, state, bytes, packed_gpr);
     factory
         .info(instruction)
         .used_memory()
@@ -433,14 +522,16 @@ fn business_writes(
                     .ok()
                     .and_then(|width| start.checked_add(width))
             };
-            // Split only a recognized exact vector store. Unknown lanes still
+            // Split only a recognized exact packed store. Unknown lanes still
             // write four bytes and must revoke any overlapping scalar proof.
-            let split = vector_copy_width(instruction).filter(|vector_bytes| {
-                bytes == 4
-                    && *vector_bytes == width
-                    && end == start.checked_add(*vector_bytes as i64)
-                    && direct_offset_width(instruction, 0, state, *vector_bytes).is_some()
-            });
+            let split = vector_copy_width(instruction)
+                .or_else(|| packed_gpr.then(|| gpr_copy_width(instruction)).flatten())
+                .filter(|vector_bytes| {
+                    bytes == 4
+                        && *vector_bytes == width
+                        && end == start.checked_add(*vector_bytes as i64)
+                        && direct_offset_width(instruction, 0, state, *vector_bytes).is_some()
+                });
             let count = split.map_or(1, |bytes| bytes / 4);
             (0..count)
                 .map(|index| {
@@ -479,6 +570,7 @@ fn transfer(
     state: &State,
     factory: &mut InstructionInfoFactory,
     bytes: usize,
+    packed_gpr: bool,
     context: Option<&FactoryContext>,
 ) -> State {
     // Evaluate the source while a destination register still holds its old
@@ -516,8 +608,13 @@ fn transfer(
             _ => false,
         }
     {
-        operand(instruction, 1, state, bytes)
+        operand(instruction, 1, state, bytes, packed_gpr)
             .filter(|value| !pointer_value(value) || instruction.op0_register().size() == 8)
+            .or_else(|| {
+                packed_gpr
+                    .then(|| gpr_operand(instruction, 1, state).map(Value::GprLanes))
+                    .flatten()
+            })
     } else if bytes == 4 {
         vector_assignment(instruction, state)
     } else {
@@ -554,7 +651,7 @@ fn transfer(
     next
 }
 
-fn join(current: &mut State, incoming: &State) -> (bool, bool) {
+fn join(current: &mut State, incoming: &State, packed_gpr: bool) -> (bool, bool) {
     let old = current.clone();
     let mut field_conflict = false;
     current.retain(|register, value| {
@@ -562,6 +659,25 @@ fn join(current: &mut State, incoming: &State) -> (bool, bool) {
             return false;
         };
         match (&mut *value, other) {
+            (value, other)
+                if matches!(value, Value::GprLanes(_)) || matches!(other, Value::GprLanes(_)) =>
+            {
+                if !packed_gpr {
+                    return false;
+                }
+                let Some(mut lanes) = gpr_value_lanes(value) else {
+                    return false;
+                };
+                let Some(other_lanes) = gpr_value_lanes(other) else {
+                    return false;
+                };
+                for (lane, other) in lanes.iter_mut().zip(&other_lanes) {
+                    join_lane(lane, other);
+                }
+                let known = lanes.iter().any(Option::is_some);
+                *value = Value::GprLanes(lanes);
+                known
+            }
             (Value::Vector(lanes), Value::Vector(other_lanes)) => {
                 for (lane, other) in lanes.iter_mut().zip(other_lanes) {
                     join_lane(lane, other);
@@ -698,6 +814,46 @@ pub(super) fn scan(code: &[u8], rva: usize, mode: Mode) -> ScanResult {
 
 pub(super) fn scan_typed(code: &[u8], rva: usize, mode: Mode, bytes: usize) -> ScanResult {
     scan_controlled_typed(code, rva, mode, &BTreeSet::new(), &BTreeMap::new(), bytes)
+}
+
+pub(super) fn readonly_getter_offset(code: &[u8], rva: usize, bytes: usize) -> Option<u32> {
+    // Without an independent setter, require a complete, non-computing leaf:
+    // one exact own-field load into the ABI return register, then plain RET.
+    // Trailing alignment bytes are unreachable and belong to the supplied
+    // current metadata/PE upper bound, not to an alternate getter path.
+    rva.checked_add(code.len())?;
+    let mut decoder = Decoder::with_ip(64, code, rva as u64, DecoderOptions::NONE);
+    let load = decoder.decode();
+    let ret = decoder.decode();
+    let expected_return = match bytes {
+        1 if load.mnemonic() == Mnemonic::Movzx => Register::EAX,
+        1 => Register::AL,
+        4 => Register::EAX,
+        8 => Register::RAX,
+        _ => return None,
+    };
+    if load.is_invalid()
+        || load.encoding() != EncodingKind::Legacy
+        || !matches!(load.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx)
+        || (bytes != 1 && load.mnemonic() != Mnemonic::Mov)
+        || load.op_count() != 2
+        || load.op0_kind() != OpKind::Register
+        || load.op0_register() != expected_return
+        || load.has_lock_prefix()
+        || load.has_rep_prefix()
+        || load.has_repne_prefix()
+        || ret.is_invalid()
+        || ret.mnemonic() != Mnemonic::Ret
+        || ret.op_count() != 0
+        || ret.len() != 1
+    {
+        return None;
+    }
+    let state = State::from([(Register::RCX, Value::BusinessPtr)]);
+    let (Value::BusinessPtr, offset) = direct_offset_width(&load, 1, &state, bytes)? else {
+        return None;
+    };
+    (offset >= 16).then_some(offset)
 }
 
 #[cfg(test)]
@@ -1047,6 +1203,9 @@ fn scan_with_context(
     queued[0] = true;
     let mut factory = InstructionInfoFactory::new();
     let mut getter_join_conflict = false;
+    // Packed integer lanes extend Sync's dword proof only, not accessor policy
+    // or genuine qword scans. Static factories keep their verified owner context.
+    let packed_gpr = mode == Mode::Sync && bytes == 4;
     while let Some(index) = pending.pop_front() {
         queued[index] = false;
         let out = transfer(
@@ -1054,6 +1213,7 @@ fn scan_with_context(
             states[index].as_ref().unwrap(),
             &mut factory,
             bytes,
+            packed_gpr,
             context,
         );
         let instruction = &instructions[index];
@@ -1085,7 +1245,7 @@ fn scan_with_context(
                 &out
             };
             let changed = if let Some(state) = &mut states[target] {
-                let (changed, conflict) = join(state, edge_out);
+                let (changed, conflict) = join(state, edge_out, packed_gpr);
                 getter_join_conflict |= conflict;
                 changed
             } else {
@@ -1111,7 +1271,13 @@ fn scan_with_context(
         if edges[index].1 != 0 {
             result.rejected_sites.push(instruction.ip() as usize);
         }
-        destination_writes.extend(business_writes(instruction, state, &mut factory, bytes));
+        destination_writes.extend(business_writes(
+            instruction,
+            state,
+            &mut factory,
+            bytes,
+            packed_gpr,
+        ));
         if mode == Mode::Sync
             && instruction.flow_control() == FlowControl::Call
             && matches!(instruction.op0_kind(), OpKind::NearBranch64)
@@ -1169,7 +1335,7 @@ fn scan_with_context(
                     .insert(instruction.ip() as usize);
             }
         }
-        for (destination, value) in known_stores(instruction, state, bytes) {
+        for (destination, value) in known_stores(instruction, state, bytes, packed_gpr) {
             match (mode, value) {
                 (Mode::Sync, Lane::ProtoField { offset, loads }) => {
                     if let Some(&load_rva) = loads.first() {
@@ -1242,6 +1408,14 @@ mod parameter_tests;
 #[cfg(test)]
 #[path = "sync_factory_tests.rs"]
 mod factory_tests;
+
+#[cfg(test)]
+#[path = "sync_readonly_tests.rs"]
+mod readonly_tests;
+
+#[cfg(test)]
+#[path = "sync_gpr_lane_tests.rs"]
+mod gpr_lane_tests;
 
 #[cfg(test)]
 mod tests {

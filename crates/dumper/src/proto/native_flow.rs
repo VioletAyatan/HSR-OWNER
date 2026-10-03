@@ -23,6 +23,9 @@ pub(super) struct Plan {
     pub terminal_calls: BTreeSet<usize>,
     pub exceptional_edges: BTreeMap<usize, Vec<usize>>,
     pub switch_edges: BTreeMap<usize, Vec<usize>>,
+    pub catch_funclets: BTreeMap<usize, usize>,
+    pub try_blocks: usize,
+    pub catch_handlers: usize,
     pub code_bytes: Option<usize>,
     pub funcinfo_rva: Option<usize>,
     pub handler_rva: Option<usize>,
@@ -297,11 +300,52 @@ fn constants(graph: &Graph) -> Vec<Option<Constants>> {
     states
 }
 
-struct Unwind {
-    flags: u8,
-    data: usize,
-    local_size: usize,
-    saved_ranges: Vec<(usize, usize)>,
+pub(super) struct Unwind {
+    pub flags: u8,
+    pub data: usize,
+    pub prolog_size: usize,
+    pub local_size: usize,
+    pub frame_register: Option<Register>,
+    pub frame_offset: usize,
+    pub pushed_nonvolatile: Vec<Register>,
+    pub saved_ranges: Vec<(usize, usize)>,
+    pub operations: Vec<UnwindCode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct UnwindCode {
+    pub code_offset: usize,
+    pub operation: UnwindOperation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UnwindOperation {
+    PushNonvolatile(Register),
+    Allocate(usize),
+    SetFrameRegister,
+    SaveXmm128 { register: u8, offset: usize },
+}
+
+fn unwind_register(number: u8) -> Result<Register> {
+    Ok(match number {
+        0 => Register::RAX,
+        1 => Register::RCX,
+        2 => Register::RDX,
+        3 => Register::RBX,
+        4 => Register::RSP,
+        5 => Register::RBP,
+        6 => Register::RSI,
+        7 => Register::RDI,
+        8 => Register::R8,
+        9 => Register::R9,
+        10 => Register::R10,
+        11 => Register::R11,
+        12 => Register::R12,
+        13 => Register::R13,
+        14 => Register::R14,
+        15 => Register::R15,
+        _ => anyhow::bail!("invalid unwind register"),
+    })
 }
 impl<'a> Resolver<'a> {
     pub(super) fn new(pe: Pe<'a>, binding: Binding) -> Self {
@@ -375,6 +419,7 @@ impl<'a> Resolver<'a> {
         let flags = head[0] >> 3;
         ensure!(flags & !3 == 0, "chained/unknown unwind flags");
         let count = usize::from(head[2]);
+        let prolog_size = usize::from(head[1]);
         let codes = self.pe.bytes(
             f.unwind + 4,
             count.checked_mul(2).context("unwind codes overflow")?,
@@ -382,41 +427,96 @@ impl<'a> Resolver<'a> {
         let mut local_size = 0;
         let mut saved_ranges = Vec::new();
         let mut saved_xmm = BTreeSet::new();
+        let mut pushed_nonvolatile = Vec::new();
+        let mut set_frame_register = false;
+        let mut operations = Vec::new();
+        let mut previous_code_offset = None;
         let mut index = 0;
         // Supported local-frame shape: register pushes, a single local
         // allocation, an optional frame pointer, and XMM save slots. Other
         // saved-register layouts and stack adjustments are rejected for EH.
         while index < count {
+            let code_offset = codes[index * 2];
+            ensure!(
+                code_offset > 0 && usize::from(code_offset) <= prolog_size,
+                "invalid unwind prolog code offset"
+            );
+            ensure!(
+                previous_code_offset.is_none_or(|previous| code_offset < previous),
+                "unwind operations are not in strict descending prolog order"
+            );
+            previous_code_offset = Some(code_offset);
             let op = codes[index * 2 + 1] & 15;
             let info = codes[index * 2 + 1] >> 4;
             match op {
-                0 | 3 => {}
+                0 => {
+                    let register = unwind_register(info)?;
+                    ensure!(
+                        matches!(
+                            register,
+                            Register::RBX
+                                | Register::RBP
+                                | Register::RSI
+                                | Register::RDI
+                                | Register::R12
+                                | Register::R13
+                                | Register::R14
+                                | Register::R15
+                        ) && !pushed_nonvolatile.contains(&register),
+                        "invalid or duplicate pushed nonvolatile register"
+                    );
+                    pushed_nonvolatile.push(register);
+                    operations.push(UnwindCode {
+                        code_offset: usize::from(code_offset),
+                        operation: UnwindOperation::PushNonvolatile(register),
+                    });
+                }
+                3 => {
+                    ensure!(
+                        info == 0 && !set_frame_register,
+                        "invalid or duplicate set-frame unwind operation"
+                    );
+                    set_frame_register = true;
+                    operations.push(UnwindCode {
+                        code_offset: usize::from(code_offset),
+                        operation: UnwindOperation::SetFrameRegister,
+                    });
+                }
                 2 => {
                     ensure!(local_size == 0, "multiple local allocations");
                     local_size = usize::from(info) * 8 + 8;
+                    operations.push(UnwindCode {
+                        code_offset: usize::from(code_offset),
+                        operation: UnwindOperation::Allocate(local_size),
+                    });
                 }
                 1 => {
                     ensure!(local_size == 0, "multiple local allocations");
                     if info == 0 {
                         ensure!(index + 1 < count, "truncated alloc-large");
-                        local_size = usize::from(u16::from_le_bytes(
+                        let units = usize::from(u16::from_le_bytes(
                             codes[(index + 1) * 2..(index + 2) * 2].try_into()?,
-                        )) * 8;
+                        ));
+                        ensure!(units > 0, "zero-length alloc-large");
+                        local_size = units * 8;
                         index += 1;
                     } else {
                         ensure!(info == 1 && index + 2 < count, "unsupported alloc-large");
                         local_size =
                             u32::from_le_bytes(codes[(index + 1) * 2..(index + 3) * 2].try_into()?)
                                 as usize;
+                        ensure!(
+                            local_size > 0 && local_size % 8 == 0,
+                            "invalid alloc-large size"
+                        );
                         index += 2;
                     }
+                    operations.push(UnwindCode {
+                        code_offset: usize::from(code_offset),
+                        operation: UnwindOperation::Allocate(local_size),
+                    });
                 }
                 8 => {
-                    let code_offset = codes[index * 2];
-                    ensure!(
-                        code_offset > 0 && usize::from(code_offset) <= usize::from(head[1]),
-                        "invalid save-xmm prolog code offset"
-                    );
                     ensure!(
                         (6..=15).contains(&info),
                         "save-xmm register is outside XMM6-XMM15"
@@ -430,6 +530,13 @@ impl<'a> Resolver<'a> {
                     .context("save-xmm offset overflow")?;
                     let end = offset.checked_add(16).context("save-xmm range overflow")?;
                     saved_ranges.push((offset, end));
+                    operations.push(UnwindCode {
+                        code_offset: usize::from(code_offset),
+                        operation: UnwindOperation::SaveXmm128 {
+                            register: info,
+                            offset,
+                        },
+                    });
                     index += 1;
                 }
                 _ => {
@@ -454,6 +561,36 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
+        let declared_frame = head[3] & 15;
+        let frame_offset = usize::from(head[3] >> 4) * 16;
+        let frame_register = if set_frame_register {
+            ensure!(
+                declared_frame != 0,
+                "set-frame operation has no declared register"
+            );
+            let register = unwind_register(declared_frame)?;
+            ensure!(
+                matches!(
+                    register,
+                    Register::RBX
+                        | Register::RBP
+                        | Register::RSI
+                        | Register::RDI
+                        | Register::R12
+                        | Register::R13
+                        | Register::R14
+                        | Register::R15
+                ) && frame_offset <= local_size,
+                "invalid unwind frame register or offset"
+            );
+            Some(register)
+        } else {
+            ensure!(
+                head[3] == 0,
+                "declared unwind frame lacks set-frame operation"
+            );
+            None
+        };
         let data = f
             .unwind
             .checked_add(4)
@@ -465,9 +602,18 @@ impl<'a> Resolver<'a> {
         Ok(Unwind {
             flags,
             data,
+            prolog_size,
             local_size,
+            frame_register,
+            frame_offset,
+            pushed_nonvolatile,
             saved_ranges,
+            operations,
         })
+    }
+
+    pub(super) fn unwind_profile(&self, rva: usize) -> Result<Unwind> {
+        self.unwind(self.pe.function(rva)?)
     }
 
     fn graph(&self, rva: usize) -> Result<Graph> {
@@ -623,6 +769,27 @@ impl<'a> Resolver<'a> {
         Ok(plan)
     }
 
+    pub(super) fn exception_plan(&self, rva: usize, code: &[u8]) -> Result<Plan> {
+        let decoded = super::native_switch::decode(code, rva)?;
+        let mut plan = Plan {
+            switch_edges: decoded.switch_edges,
+            code_bytes: (!decoded.protected_ranges.is_empty()).then_some(decoded.code_bytes),
+            ..Plan::default()
+        };
+        self.caller_eh(
+            rva,
+            code,
+            &decoded.instructions,
+            &decoded.protected_ranges,
+            &mut plan,
+        )?;
+        ensure!(
+            plan.funcinfo_rva.is_some() && plan.handler_rva.is_some(),
+            "allocator wrapper has no proved exception handler"
+        );
+        Ok(plan)
+    }
+
     fn caller_eh(
         &self,
         rva: usize,
@@ -695,6 +862,7 @@ impl<'a> Resolver<'a> {
             ips.push((ip, state));
         }
         let mut handlers = Vec::new();
+        plan.try_blocks = tries;
         for n in 0..tries {
             let at = try_map + n * 20;
             let low = self.pe.i32(at)?;
@@ -711,6 +879,10 @@ impl<'a> Resolver<'a> {
                 .bytes(map, catches.checked_mul(20).context("catch-map overflow")?)?;
             let mut continuations = Vec::new();
             for h in 0..catches {
+                plan.catch_handlers = plan
+                    .catch_handlers
+                    .checked_add(1)
+                    .context("catch-handler count overflow")?;
                 let at = map + h * 20;
                 // Resumable/CLR filters have additional semantics. Current
                 // ordinary by-reference typed catches use HT_IsReference=8.
@@ -722,11 +894,15 @@ impl<'a> Resolver<'a> {
                 if descriptor != 0 {
                     self.pe.bytes(descriptor, 16)?;
                 }
-                let continuation = self.funclet(
-                    self.pe.u32(at + 12)? as usize,
-                    unwind.local_size,
-                    &unwind.saved_ranges,
-                )?;
+                let funclet = self.pe.u32(at + 12)? as usize;
+                let continuation =
+                    self.funclet(funclet, unwind.local_size, &unwind.saved_ranges)?;
+                if let Some(previous) = plan.catch_funclets.insert(funclet, continuation) {
+                    ensure!(
+                        previous == continuation,
+                        "catch funclet has inconsistent continuations"
+                    );
+                }
                 ensure!(
                     ins.iter().any(|i| i.ip() as usize == continuation)
                         && !protected_ranges
@@ -1251,6 +1427,7 @@ mod tests {
         code: &[u8],
         prolog_size: u8,
         slot_count: usize,
+        frame: u8,
         slots: &[u8],
     ) -> Result<Unwind> {
         let mut image = fixture(code);
@@ -1258,7 +1435,7 @@ mod tests {
         image[0x400] = 1;
         image[0x401] = prolog_size;
         image[0x402] = u8::try_from(slot_count)?;
-        image[0x403] = 0;
+        image[0x403] = frame;
         image[0x404..0x404 + slots.len()].copy_from_slice(slots);
         let pe = Pe::new(&image, readable)?;
         let function = pe.function(0x800)?;
@@ -1274,10 +1451,31 @@ mod tests {
     #[test]
     fn gridfight_save_xmm128_unwind_and_parent_catch_write_are_supported() -> Result<()> {
         let record = gridfight_unwind_slots();
-        let unwind = unwind_fixture(&[0xc3; 37], record[1], 15, &record[4..])?;
+        let unwind = unwind_fixture(&[0xc3; 37], record[1], 15, record[3], &record[4..])?;
         assert_eq!(unwind.flags, 0);
         assert_eq!(unwind.local_size, 0xf8);
         assert_eq!(unwind.saved_ranges, [(0xd0, 0xe0), (0xe0, 0xf0)]);
+        let wrapper_slots = [10, 0x03, 5, 0x52, 1, 0x50];
+        let wrapper = unwind_fixture(&[0xc3; 37], 10, 3, 0x35, &wrapper_slots)?;
+        assert_eq!(
+            wrapper.operations,
+            [
+                UnwindCode {
+                    code_offset: 10,
+                    operation: UnwindOperation::SetFrameRegister,
+                },
+                UnwindCode {
+                    code_offset: 5,
+                    operation: UnwindOperation::Allocate(0x30),
+                },
+                UnwindCode {
+                    code_offset: 1,
+                    operation: UnwindOperation::PushNonvolatile(Register::RBP),
+                },
+            ]
+        );
+        assert!(unwind_fixture(&[0xc3; 37], 10, 3, 0x35, &[1, 0x50, 10, 0x03, 5, 0x52]).is_err());
+        assert!(unwind_fixture(&[0xc3; 37], 10, 3, 0x31, &wrapper_slots).is_err());
 
         // Mirrors the GridFight funclet's RBP=RDX+0x80 parent-frame write.
         let catch = funclet_code(
@@ -1313,7 +1511,7 @@ mod tests {
         ];
         for (name, slots) in cases {
             assert!(
-                unwind_fixture(&[0xc3; 16], 5, slots.len() / 2, slots).is_err(),
+                unwind_fixture(&[0xc3; 16], 5, slots.len() / 2, 0, slots).is_err(),
                 "accepted malformed save-xmm unwind: {name}"
             );
         }
@@ -1410,6 +1608,37 @@ mod tests {
         let code = resolver.pe.bytes(f.start, f.end - f.start)?;
         let timer = Instant::now();
         let plan = resolver.plan(f.start, code)?;
+        let allocator = resolver.pe.function(0x3eac500)?;
+        let allocator_code = resolver
+            .pe
+            .bytes(allocator.start, allocator.end - allocator.start)?;
+        let allocator_plan = resolver.exception_plan(allocator.start, allocator_code)?;
+        let allocator_unwind = resolver.unwind_profile(allocator.start)?;
+        let catch_unwind = resolver.unwind_profile(0x3eac530)?;
+        ensure!(
+            allocator_plan.try_blocks == 1
+                && allocator_plan.catch_handlers == 1
+                && allocator_plan.catch_funclets.get(&0x3eac530) == Some(&0x3eac51b)
+                && allocator_plan.exceptional_edges.get(&0x3eac512) == Some(&vec![0x3eac51b]),
+            "current allocator FH3 wrapper proof changed"
+        );
+        ensure!(
+            allocator_unwind.flags == 3
+                && allocator_unwind.prolog_size == 10
+                && allocator_unwind.local_size == 0x30
+                && allocator_unwind.frame_register == Some(Register::RBP)
+                && allocator_unwind.frame_offset == 0x30
+                && allocator_unwind.pushed_nonvolatile == [Register::RBP]
+                && catch_unwind.flags == 3
+                && catch_unwind.prolog_size == 14
+                && catch_unwind.local_size == 0x20
+                && catch_unwind.frame_register.is_none()
+                && catch_unwind.pushed_nonvolatile == [Register::RBP]
+                && allocator_plan.handler_rva == Some(resolver.pe.u32(catch_unwind.data)? as usize)
+                && allocator_plan.funcinfo_rva
+                    == Some(resolver.pe.u32(catch_unwind.data + 4)? as usize),
+            "current allocator/catch unwind frame proof changed"
+        );
         let before = sync_scan::scan(code, f.start, Mode::Sync);
         let after = sync_scan::scan_controlled(
             code,
@@ -1423,7 +1652,7 @@ mod tests {
             .iter()
             .map(|c| (c.proto_offset, c.business_offset))
             .collect();
-        let report = serde_json::json!({"source_dll":dll,"binding":"declared-disk-only","preferred_base":preferred_base,"runtime_functions":function_count,"body_bytes":code.len(),"elapsed_ms":timer.elapsed().as_secs_f64()*1000.0,"plan":plan,"statistics":resolver.stats,"before_copies":before.copies.iter().map(|c|(c.proto_offset,c.business_offset)).collect::<Vec<_>>(),"after_copies":copies,"boundary":"Current native code and supported MSVC FH3/EH metadata only; no runtime reflection, IAT, original-name or in-game verification."});
+        let report = serde_json::json!({"source_dll":dll,"binding":"declared-disk-only","preferred_base":preferred_base,"runtime_functions":function_count,"body_bytes":code.len(),"elapsed_ms":timer.elapsed().as_secs_f64()*1000.0,"plan":plan,"allocator_plan":allocator_plan,"statistics":resolver.stats,"before_copies":before.copies.iter().map(|c|(c.proto_offset,c.business_offset)).collect::<Vec<_>>(),"after_copies":copies,"boundary":"Current native code and supported MSVC FH3/EH metadata only; no runtime reflection, IAT, original-name or in-game verification."});
         fs::create_dir_all(&out)?;
         fs::write(
             out.join("active-flow-replay.json"),

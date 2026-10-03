@@ -1,5 +1,6 @@
 //! Name an unknown wire field only through a direct native instance copy into an
-//! own, typed business property with independently agreeing getter and setter.
+//! own, typed business member. Properties require agreeing getter/setter offsets
+//! or a plain-metadata readonly property with an exact non-computing leaf getter.
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -43,14 +44,14 @@ use crate::{dump_progress::Progress, script::memory};
 mod constructors;
 #[path = "sync_declared_fields.rs"]
 mod declared_fields;
+#[path = "sync_factory_binding.rs"]
+pub(super) mod factory_binding;
 #[path = "sync_parameter.rs"]
 mod parameter_types;
 #[path = "sync_property_name.rs"]
 mod property_names;
 #[path = "sync_signature.rs"]
 mod signatures;
-#[path = "sync_factory_binding.rs"]
-pub(super) mod factory_binding;
 
 use parameter_types::ParameterProof;
 use property_names::PropertyNameProof;
@@ -162,6 +163,7 @@ pub(super) struct SyncFields {
     declared_fields: usize,
     obfuscated_property_names: usize,
     accessor_named_properties: usize,
+    readonly_properties: usize,
     copies: usize,
     setter_call_copies: usize,
     conflicts: usize,
@@ -401,6 +403,9 @@ fn wire_bytes(kind: &str, enum_names: &HashSet<String>) -> Option<usize> {
 
 fn same_proto_property(proto: RuntimeType, name: &str, ty: RuntimeType) -> Result<bool> {
     let property = proto.get_property(name.into(), 54)?;
+    if property.0 == 0 {
+        return Ok(false);
+    }
     memory::readable(property.0, 24)?;
     if checked_name(property.get_name()?)? != name || property.get_property_type()? != ty {
         return Ok(false);
@@ -640,6 +645,24 @@ fn body<'a>(method: MethodInfo, image: &'a [u8], bounds: &Bounds<'_>) -> Result<
     native_body(handle, image, bounds)
 }
 
+fn property_accessor_offset(
+    metadata_name: &str,
+    getter: (&[u8], usize),
+    setter: Option<(&[u8], usize)>,
+    bytes: usize,
+) -> Option<u32> {
+    let Some((setter_body, setter_rva)) = setter else {
+        if !identifier(metadata_name) || is_obf(metadata_name) {
+            return None;
+        }
+        return sync_scan::readonly_getter_offset(getter.0, getter.1, bytes);
+    };
+    let read = sync_scan::scan_typed(getter.0, getter.1, Mode::Getter, bytes);
+    let write = sync_scan::scan_typed(setter_body, setter_rva, Mode::Setter, bytes);
+    read.accessor_offset
+        .filter(|offset| *offset >= 16 && Some(*offset) == write.accessor_offset)
+}
+
 fn native_body<'a>(
     handle: Il2CppMethod,
     image: &'a [u8],
@@ -677,6 +700,27 @@ fn native_body<'a>(
         .context("method body outside GameAssembly")?;
     memory::readable(body.as_ptr() as usize, body.len())?;
     Ok((rva, body))
+}
+
+fn select_property_group(group: &[Accessor]) -> Option<&Accessor> {
+    let first = group.first()?;
+    group
+        .iter()
+        .all(|accessor| {
+            accessor.name == first.name
+                && accessor.kind == first.kind
+                && accessor.ty == first.ty
+                && accessor.bytes == first.bytes
+        })
+        .then(|| {
+            // Inputs have already passed their metadata/native-offset gates.
+            // Keep the first paired property and its setter/name provenance;
+            // a readonly alias must not replace existing setter evidence.
+            group
+                .iter()
+                .find(|accessor| accessor.member_kind == "property")
+                .unwrap_or(first)
+        })
 }
 
 impl SyncFields {
@@ -734,24 +778,38 @@ impl SyncFields {
                 decision.stage = "property-accessors".to_owned();
                 let getter = property.get_get_method(true)?;
                 let setter = property.get_set_method(true)?;
-                if getter.0 == 0 || setter.0 == 0 {
-                    decision.reason = "missing-getter-or-setter".to_owned();
+                if getter.0 == 0 {
+                    decision.reason = "missing-getter".to_owned();
                     return Ok(None);
                 }
-                if !instance(getter, owner)? || !instance(setter, owner)? {
+                let readonly = setter.0 == 0;
+                if readonly && obfuscated_name {
+                    decision.reason = "readonly-property-metadata-obfuscated".to_owned();
+                    return Ok(None);
+                }
+                if !instance(getter, owner)? || (!readonly && !instance(setter, owner)?) {
                     decision.reason = "accessor-not-instance-or-declared-by-owner".to_owned();
                     return Ok(None);
                 }
+                if readonly && reflection_bool(getter.get_is_generic_method()?)? {
+                    decision.reason = "generic-readonly-getter".to_owned();
+                    return Ok(None);
+                }
                 let getter_params = parameters(getter, self)?;
-                let setter_params = parameters(setter, self)?;
-                if !getter_params.is_empty()
-                    || setter_params.len() != 1
-                    || getter.get_return_type()? != ty
-                    || setter_params[0].get_parameter_type()? != ty
-                    || checked_name(setter.get_return_type()?.get_full_name()?)? != "System.Void"
-                {
+                if !getter_params.is_empty() || getter.get_return_type()? != ty {
                     decision.reason = "accessor-signature-type-mismatch-or-indexer".to_owned();
                     return Ok(None);
+                }
+                if !readonly {
+                    let setter_params = parameters(setter, self)?;
+                    if setter_params.len() != 1
+                        || setter_params[0].get_parameter_type()? != ty
+                        || checked_name(setter.get_return_type()?.get_full_name()?)?
+                            != "System.Void"
+                    {
+                        decision.reason = "accessor-signature-type-mismatch-or-indexer".to_owned();
+                        return Ok(None);
+                    }
                 }
                 // Obtain both methods from this exact PropertyInfo. Their
                 // names supply a business alias only when the property name
@@ -782,15 +840,25 @@ impl SyncFields {
                 };
                 decision.stage = "accessor-native-offset".to_owned();
                 let (getter_rva, getter_body) = body(getter, image, bounds)?;
-                let (setter_rva, setter_body) = body(setter, image, bounds)?;
-                let read = sync_scan::scan_typed(getter_body, getter_rva, Mode::Getter, bytes);
-                let write = sync_scan::scan_typed(setter_body, setter_rva, Mode::Setter, bytes);
-                let Some(offset) = read
-                    .accessor_offset
-                    .filter(|offset| *offset >= 16 && Some(*offset) == write.accessor_offset)
-                else {
+                let setter_body = if readonly {
+                    None
+                } else {
+                    let (rva, code) = body(setter, image, bounds)?;
+                    Some((code, rva))
+                };
+                let Some(offset) = property_accessor_offset(
+                    &metadata_name,
+                    (getter_body, getter_rva),
+                    setter_body,
+                    bytes,
+                ) else {
                     self.unbound_accessors += 1;
-                    decision.reason = "getter-setter-offset-unbound".to_owned();
+                    decision.reason = if readonly {
+                        "readonly-getter-not-exact-leaf"
+                    } else {
+                        "getter-setter-offset-unbound"
+                    }
+                    .to_owned();
                     return Ok(None);
                 };
                 decision.business_offset = Some(offset);
@@ -801,8 +869,14 @@ impl SyncFields {
                     "business property offset exceeds its instance layout"
                 );
                 decision.stage = "accepted-property".to_owned();
-                decision.reason = "property-name-type-and-native-offset-proven".to_owned();
+                decision.reason = if readonly {
+                    "readonly-property-name-type-and-leaf-offset-proven"
+                } else {
+                    "property-name-type-and-native-offset-proven"
+                }
+                .to_owned();
                 self.accessor_named_properties += usize::from(obfuscated_name);
+                self.readonly_properties += usize::from(readonly);
                 Ok(Some(Accessor {
                     name: snake_field(&name),
                     kind,
@@ -810,8 +884,12 @@ impl SyncFields {
                     bytes,
                     offset,
                     getter_rva,
-                    setter_rva,
-                    member_kind: "property",
+                    setter_rva: setter_body.map_or(0, |(_, rva)| rva),
+                    member_kind: if readonly {
+                        "readonly-property"
+                    } else {
+                        "property"
+                    },
                     name_proof: Some(name_proof),
                 }))
             })();
@@ -839,13 +917,8 @@ impl SyncFields {
         let mut unique = Vec::new();
         let mut conflicting_property_offsets = HashSet::new();
         for group in grouped.into_values() {
-            if group.iter().all(|a| {
-                a.name == group[0].name
-                    && a.kind == group[0].kind
-                    && a.ty == group[0].ty
-                    && a.bytes == group[0].bytes
-            }) {
-                unique.push(group[0].clone());
+            if let Some(accessor) = select_property_group(&group) {
+                unique.push(accessor.clone());
             } else {
                 self.conflicts += 1;
                 conflicting_property_offsets.insert(group[0].offset);
@@ -1011,7 +1084,7 @@ impl SyncFields {
         );
         let report = serde_json::json!({
             "game_version": &*crate::version::GAME_VERSION,
-            "source": "current instance native methods with one Proto parameter and exact typed copy to own property getter/setter (direct store or bound setter call) or non-overlapping declared instance field; validated tail exits prove frame restoration only, hotfix overrides are not executed by this collector",
+            "source": "current instance native methods with one Proto parameter and exact typed copy to an own paired getter/setter property (direct store or bound setter call), a plain-metadata readonly property with an exact non-computing leaf getter (direct store only), or a non-overlapping declared instance field; validated tail exits prove frame restoration only, hotfix overrides are not executed by this collector",
             "accepted_tags": accepted.len(), "preserved_tags": self.preserved_existing.len(),
             "existing_name_collisions": self.rejected_existing_collisions.len(), "summary": self,
         });
@@ -1670,9 +1743,10 @@ fn collect_inner(
         out.control_flow_errors
     );
     log::info!(
-        "[Sync Fields] property names: obfuscated_metadata={} bound_accessor_names={}",
+        "[Sync Fields] property names: obfuscated_metadata={} bound_accessor_names={} readonly_leaf_properties={}",
         out.obfuscated_property_names,
-        out.accessor_named_properties
+        out.accessor_named_properties,
+        out.readonly_properties
     );
     log::info!(
         "[Sync Fields] candidates: methods={} sync_methods={} specialized_sync_methods={} other_proto_methods={} reference_returns={} multi_parameter_methods={} shifted_proto_methods={} unsupported_returns={} owners={} members={} declared_fields={} copies={} tags={} conflicts={} metadata_errors={}",
@@ -1720,6 +1794,265 @@ pub(super) fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GROUP_CALLER_RVA: usize = 0x1000;
+    const GROUP_SETTER_RVA: usize = 0x4000;
+
+    fn group_property(name: &str, getter_rva: usize, setter_rva: Option<usize>) -> Accessor {
+        let getter = [0x8b, 0x41, 0x4c, 0xc3];
+        let setter = [0x89, 0x51, 0x4c, 0xc3];
+        let offset = property_accessor_offset(
+            name,
+            (&getter, getter_rva),
+            setter_rva.map(|rva| (&setter[..], rva)),
+            4,
+        )
+        .unwrap();
+        let (name, name_proof) = property_names::recover(Some(name), None, None).unwrap();
+        Accessor {
+            name: snake_field(&name),
+            kind: "uint32".into(),
+            // A token for exact type-identity comparisons, never dereferenced.
+            ty: RuntimeType(1),
+            bytes: 4,
+            offset,
+            getter_rva,
+            setter_rva: setter_rva.unwrap_or(0),
+            member_kind: if setter_rva.is_some() {
+                "property"
+            } else {
+                "readonly-property"
+            },
+            name_proof: Some(name_proof),
+        }
+    }
+
+    fn readonly_paired_group(readonly_first: bool) -> [Accessor; 2] {
+        let readonly = group_property("ActionID", 0x2100, None);
+        let paired = group_property("ActionId", 0x2000, Some(GROUP_SETTER_RVA));
+        assert_eq!(readonly.name, paired.name);
+        assert_eq!(readonly.offset, paired.offset);
+        if readonly_first {
+            [readonly, paired]
+        } else {
+            [paired, readonly]
+        }
+    }
+
+    fn assert_paired_group_keeps_setter(readonly_first: bool) {
+        let group = readonly_paired_group(readonly_first);
+        let selected = select_property_group(&group).unwrap();
+        let paired = group.iter().find(|a| a.member_kind == "property").unwrap();
+        assert_eq!(selected.member_kind, "property");
+        assert_eq!(selected.setter_rva, GROUP_SETTER_RVA);
+        assert_eq!(selected.getter_rva, paired.getter_rva);
+        assert_eq!(selected.name_proof, paired.name_proof);
+    }
+
+    #[test]
+    fn readonly_paired_group_keeps_setter_when_readonly_is_first() {
+        assert_paired_group_keeps_setter(true);
+    }
+
+    #[test]
+    fn readonly_paired_group_keeps_setter_when_paired_is_first() {
+        assert_paired_group_keeps_setter(false);
+    }
+
+    fn group_setter_caller(prefix: &[u8]) -> Vec<u8> {
+        let mut code = prefix.to_vec();
+        let call_site = GROUP_CALLER_RVA + code.len();
+        let displacement = i32::try_from(GROUP_SETTER_RVA as i64 - (call_site + 5) as i64).unwrap();
+        code.push(0xe8);
+        code.extend_from_slice(&displacement.to_le_bytes());
+        code.push(0xc3);
+        code
+    }
+
+    fn bind_group_setters(scan: &mut sync_scan::ScanResult, group: &[Accessor]) {
+        let business = [select_property_group(group).unwrap().clone()];
+        // Match the production binding after property-group selection, rather
+        // than supplying an independently known setter that masks the bug.
+        scan.bind_setter_calls(4, |target| {
+            let mut matches = business
+                .iter()
+                .filter(|a| a.member_kind == "property" && a.setter_rva == target);
+            let first = matches.next()?;
+            matches
+                .next()
+                .is_none()
+                .then_some((first.offset, first.bytes))
+        });
+    }
+
+    fn assert_paired_group_recovers_setter_call(readonly_first: bool) {
+        let group = readonly_paired_group(readonly_first);
+        let code = group_setter_caller(&[0x8b, 0x52, 0x24]); // mov edx,[rdx+36]
+        let mut scan = sync_scan::scan_typed(&code, GROUP_CALLER_RVA, Mode::Sync, 4);
+        assert_eq!(scan.rejected_paths, 0);
+        assert!(scan.copies.is_empty());
+        assert_eq!(scan.call_arguments.len(), 1);
+        assert_eq!(scan.call_arguments[0].target_rva, GROUP_SETTER_RVA);
+        assert!(scan.call_arguments[0].receiver_is_business);
+        bind_group_setters(&mut scan, &group);
+        assert_eq!(
+            scan.copies,
+            [sync_scan::CopyEvidence {
+                proto_offset: 36,
+                business_offset: 76,
+                load_rva: GROUP_CALLER_RVA,
+                store_rva: GROUP_CALLER_RVA + 3,
+                setter_call: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn readonly_paired_group_recovers_setter_call_when_readonly_is_first() {
+        assert_paired_group_recovers_setter_call(true);
+    }
+
+    #[test]
+    fn readonly_paired_group_recovers_setter_call_when_paired_is_first() {
+        assert_paired_group_recovers_setter_call(false);
+    }
+
+    fn assert_paired_group_rejects_overwritten_direct_copy(readonly_first: bool) {
+        let group = readonly_paired_group(readonly_first);
+        let code = group_setter_caller(&[
+            0x8b, 0x42, 0x24, // mov eax,[rdx+36]
+            0x89, 0x41, 0x4c, // mov [rcx+76],eax
+            0x31, 0xd2, // xor edx,edx: the setter overwrites with zero
+        ]);
+        let mut scan = sync_scan::scan_typed(&code, GROUP_CALLER_RVA, Mode::Sync, 4);
+        assert_eq!(scan.rejected_paths, 0);
+        assert_eq!(
+            scan.copies,
+            [sync_scan::CopyEvidence {
+                proto_offset: 36,
+                business_offset: 76,
+                load_rva: GROUP_CALLER_RVA,
+                store_rva: GROUP_CALLER_RVA + 3,
+                setter_call: false,
+            }]
+        );
+        assert!(scan.call_arguments.is_empty());
+        bind_group_setters(&mut scan, &group);
+        assert!(scan.copies.is_empty());
+        assert!(scan.ambiguous);
+    }
+
+    #[test]
+    fn readonly_paired_group_rejects_overwritten_copy_when_readonly_is_first() {
+        assert_paired_group_rejects_overwritten_direct_copy(true);
+    }
+
+    #[test]
+    fn readonly_paired_group_rejects_overwritten_copy_when_paired_is_first() {
+        assert_paired_group_rejects_overwritten_direct_copy(false);
+    }
+
+    #[test]
+    fn readonly_paired_group_preserves_the_first_paired_property_evidence() {
+        let [readonly, first] = readonly_paired_group(true);
+        let second = group_property("ActionID", 0x2200, Some(0x4100));
+        for group in [
+            [readonly.clone(), first.clone(), second.clone()],
+            [first.clone(), readonly.clone(), second.clone()],
+            [first.clone(), second.clone(), readonly.clone()],
+            [second.clone(), readonly, first.clone()],
+        ] {
+            let expected = group.iter().find(|a| a.member_kind == "property").unwrap();
+            let selected = select_property_group(&group).unwrap();
+            assert!(std::ptr::eq(selected, expected));
+            assert_eq!(selected.getter_rva, expected.getter_rva);
+            assert_eq!(selected.setter_rva, expected.setter_rva);
+            assert_eq!(selected.name_proof, expected.name_proof);
+        }
+        let paired_only = [first, second];
+        assert!(std::ptr::eq(
+            select_property_group(&paired_only).unwrap(),
+            &paired_only[0]
+        ));
+    }
+
+    #[test]
+    fn readonly_paired_group_keeps_readonly_fallback_without_a_paired_property() {
+        let first = group_property("ActionID", 0x2100, None);
+        let second = group_property("ActionId", 0x2200, None);
+        for group in [[first.clone(), second.clone()], [second, first]] {
+            let selected = select_property_group(&group).unwrap();
+            assert!(std::ptr::eq(selected, &group[0]));
+            assert_eq!(selected.member_kind, "readonly-property");
+            assert_eq!(selected.setter_rva, 0);
+            assert_eq!(selected.name_proof, group[0].name_proof);
+        }
+    }
+
+    #[test]
+    fn readonly_paired_group_rejects_conflicting_names_kinds_types_and_widths() {
+        let [readonly, paired] = readonly_paired_group(true);
+        for conflict in [
+            Accessor {
+                name: snake_field("OtherID"),
+                ..readonly.clone()
+            },
+            Accessor {
+                kind: "int32".into(),
+                ..readonly.clone()
+            },
+            Accessor {
+                ty: RuntimeType(2),
+                ..readonly.clone()
+            },
+            Accessor {
+                bytes: 8,
+                ..readonly
+            },
+        ] {
+            for group in [
+                [conflict.clone(), paired.clone()],
+                [paired.clone(), conflict.clone()],
+            ] {
+                assert!(select_property_group(&group).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_plain_property_uses_its_exact_leaf_getter_without_a_setter() {
+        let getter = [0x8b, 0x41, 0x20, 0xc3];
+        assert_eq!(
+            property_accessor_offset("ActionID", (&getter, 0x1000), None, 4),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn readonly_property_cannot_guess_a_name_or_ignore_a_present_setter() {
+        let getter = [0x8b, 0x41, 0x20, 0xc3];
+        for name in ["ABCDEFGHIJK", "", "not a property"] {
+            assert_eq!(
+                property_accessor_offset(name, (&getter, 0x1000), None, 4),
+                None
+            );
+        }
+        let wrong_setter = [0x89, 0x51, 0x24, 0xc3];
+        assert_eq!(
+            property_accessor_offset(
+                "ActionID",
+                (&getter, 0x1000),
+                Some((&wrong_setter, 0x2000)),
+                4
+            ),
+            None
+        );
+        let setter = [0x89, 0x51, 0x20, 0xc3];
+        assert_eq!(
+            property_accessor_offset("ActionID", (&getter, 0x1000), Some((&setter, 0x2000)), 4),
+            Some(32)
+        );
+    }
 
     #[test]
     fn additional_methods_are_selected_by_the_exact_actual_proto_argument() {

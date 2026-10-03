@@ -59,12 +59,14 @@ fn process_inner(items: &TypeToItemMap, result: &mut ParsedNames) -> Result<()> 
         .collect();
     super::decode_gateway::set_proto_fields(result.fields.clone());
     result.report = json!({"binding":bound.report, "message":message.name, "signature":bound.signature,
+        "owner_class_va":bound.owner_class.0,
         "rva":bound.rva,"body_end":bound.body_end,
         "loaded_code_hex":bound.code.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "evidence_boundary":"current native implementation; hotfix overrides are not executed"});
     let image = utils::game_assembly_slice();
     let pe = Pe::new(image, memory::readable)?;
-    let allocator = super::allocator::bind(&pe)?;
+    result.report["allocator_attempt"] = json!({});
+    let allocator = super::allocator::bind(&pe, &mut result.report["allocator_attempt"])?;
     let mut context = FactoryContext {
         allocator_rva: allocator.allocator_rva,
         ..FactoryContext::default()

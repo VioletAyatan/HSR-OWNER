@@ -18,13 +18,22 @@ use hsr_ipc::{
 
 pub(crate) mod actions;
 pub(crate) mod frontend;
+mod lifecycle;
 mod task_gate;
+
+use lifecycle::{
+    CommandBudget, ConnectionLifetime, ConnectionReader, ConnectionState, NativeThreads,
+    SpawnContext, ThreadSpawner, spawn_thread,
+};
 
 static DUMPER_GATE: task_gate::TaskGate = task_gate::TaskGate::new();
 
 const CUSTOM_PACKET_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 const CLIENT_QUEUE_CAPACITY: usize = 16384;
 const LOG_BACKLOG_CAPACITY: usize = 4096;
+const COMMAND_THREAD_LIMIT: usize = 16;
+static COMMAND_BUDGET: LazyLock<Arc<CommandBudget>> =
+    LazyLock::new(|| Arc::new(CommandBudget::new(COMMAND_THREAD_LIMIT)));
 
 static CLIENTS: LazyLock<Mutex<HashMap<u64, SyncSender<ServerFrame>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -40,6 +49,7 @@ struct SendPacketsResult {
 #[derive(Clone)]
 struct Responder {
     id: u64,
+    client_id: u64,
     out: SyncSender<ServerFrame>,
 }
 
@@ -60,7 +70,10 @@ fn register_client(out: SyncSender<ServerFrame>) -> u64 {
 }
 
 fn unregister_client(id: u64) {
-    CLIENTS.lock().unwrap().remove(&id);
+    CLIENTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&id);
 }
 
 fn broadcast(event: BackendEvent) {
@@ -85,7 +98,11 @@ impl Responder {
             .send(ServerFrame::Reply { id: self.id, event })
             .is_err()
         {
-            log::warn!("[Tunnel] dumper reply {}: client disconnected", self.id);
+            log::warn!(
+                "[Tunnel] dumper reply client_id={} request_id={}: client disconnected",
+                self.client_id,
+                self.id
+            );
         }
     }
 
@@ -94,40 +111,65 @@ impl Responder {
     }
 }
 
+fn start_background(spawner: &impl ThreadSpawner, role: &'static str, job: lifecycle::ThreadJob) {
+    let _ = spawn_thread(
+        spawner,
+        SpawnContext {
+            role,
+            client_id: None,
+            request_id: None,
+            peer: None,
+        },
+        job,
+    );
+}
+
 pub fn start_server() {
-    thread::spawn(|| {
-        if let Err(error) = serve_forever() {
-            log::debug!("[Tunnel] server stopped: {error:#}");
-        }
-    });
+    start_background(
+        &NativeThreads,
+        "server",
+        Box::new(|| {
+            if let Err(error) = serve_forever() {
+                log::debug!("[Tunnel] server stopped: {error:#}");
+            }
+        }),
+    );
 }
 
 pub fn start_packet_stream() {
     let rx = sniffer::init_packet_channel();
 
-    thread::spawn(move || {
-        log::debug!("[Tunnel] packet stream broadcasting");
-        for packet in rx {
-            broadcast(BackendEvent::Sniffer(SnifferEvent::Packet(packet)));
-        }
-        log::debug!("[Tunnel] packet channel closed");
-    });
+    start_background(
+        &NativeThreads,
+        "packet-stream",
+        Box::new(move || {
+            log::debug!("[Tunnel] packet stream broadcasting");
+            for packet in rx {
+                broadcast(BackendEvent::Sniffer(SnifferEvent::Packet(packet)));
+            }
+            log::debug!("[Tunnel] packet channel closed");
+        }),
+    );
 }
 
 pub fn start_log_stream(rx: Receiver<LogEntry>) {
-    thread::spawn(move || {
-        for entry in rx {
-            {
-                let mut backlog = LOG_BACKLOG.lock().unwrap();
-                if backlog.len() >= LOG_BACKLOG_CAPACITY {
-                    backlog.pop_front();
+    start_background(
+        &NativeThreads,
+        "log-stream",
+        Box::new(move || {
+            for entry in rx {
+                {
+                    let mut backlog = LOG_BACKLOG.lock().unwrap();
+                    if backlog.len() >= LOG_BACKLOG_CAPACITY {
+                        backlog.pop_front();
+                    }
+                    backlog.push_back(entry.clone());
                 }
-                backlog.push_back(entry.clone());
+                broadcast(BackendEvent::Log { entry });
             }
-            broadcast(BackendEvent::Log { entry });
-        }
-        log::warn!("[Tunnel] log channel closed");
-    });
+            log::warn!("[Tunnel] log channel closed");
+        }),
+    );
 }
 
 fn serve_forever() -> anyhow::Result<()> {
@@ -136,10 +178,30 @@ fn serve_forever() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("failed to bind tunnel {addr}: {error}"))?;
     log::debug!("[Tunnel] listening on {addr}");
 
-    for stream in listener.incoming() {
+    serve_incoming(listener.incoming(), &NativeThreads);
+
+    Ok(())
+}
+
+fn serve_incoming(
+    incoming: impl IntoIterator<Item = std::io::Result<TcpStream>>,
+    spawner: &impl ThreadSpawner,
+) {
+    for stream in incoming {
         match stream {
             Ok(stream) => {
-                thread::spawn(move || handle_connection(stream));
+                let peer = stream.peer_addr().ok();
+                // Builder drops the job (and its socket) on failure; keep accepting.
+                let _ = spawn_thread(
+                    spawner,
+                    SpawnContext {
+                        role: "connection",
+                        client_id: None,
+                        request_id: None,
+                        peer,
+                    },
+                    Box::new(move || handle_connection(stream)),
+                );
             }
             Err(error) => {
                 log::debug!("[Tunnel] accept failed: {error:#}");
@@ -147,12 +209,20 @@ fn serve_forever() -> anyhow::Result<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 fn handle_connection(stream: TcpStream) {
+    handle_connection_with_spawner(stream, &NativeThreads);
+}
+
+fn handle_connection_with_spawner(stream: TcpStream, spawner: &impl ThreadSpawner) {
+    let peer = stream.peer_addr().ok();
     let _ = stream.set_nodelay(true);
+
+    if let Err(error) = stream.set_read_timeout(Some(lifecycle::POLL_INTERVAL)) {
+        log::warn!("[Tunnel] cannot configure client read cancellation peer={peer:?}: {error}");
+        return;
+    }
 
     let write_half = match stream.try_clone() {
         Ok(half) => half,
@@ -170,30 +240,73 @@ fn handle_connection(stream: TcpStream) {
 
     let (out_tx, out_rx) = mpsc::sync_channel::<ServerFrame>(CLIENT_QUEUE_CAPACITY);
     let client_id = register_client(out_tx.clone());
-    let alive = Arc::new(AtomicBool::new(true));
+    let state = Arc::new(ConnectionState::new(client_id, stream));
+    let _connection_lifetime = ConnectionLifetime(state.clone());
 
-    let writer_alive = alive.clone();
-    let writer = thread::spawn(move || {
-        let mut socket = write_half;
-        while let Ok(frame) = out_rx.recv() {
-            if hsr_ipc::write_json_frame(&mut socket, &frame).is_err() {
-                let _ = socket.shutdown(std::net::Shutdown::Both);
-                break;
+    let writer_lifetime = ConnectionLifetime(state.clone());
+    let writer = match spawn_thread(
+        spawner,
+        SpawnContext {
+            role: "writer",
+            client_id: Some(client_id),
+            request_id: None,
+            peer,
+        },
+        Box::new(move || {
+            let lifetime = writer_lifetime;
+            let mut socket = write_half;
+            let writer_tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+            log::debug!(
+                "[Tunnel] writer entry client_id={client_id} peer={peer:?} writer_tid={writer_tid}"
+            );
+            let mut first_write = true;
+            while lifetime.0.alive.load(Ordering::SeqCst) {
+                let frame = match out_rx.recv_timeout(lifecycle::POLL_INTERVAL) {
+                    Ok(frame) => frame,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                if !lifetime.0.alive.load(Ordering::SeqCst) {
+                    break;
+                }
+                let (frame_kind, request_id) = match &frame {
+                    ServerFrame::Reply { id, .. } => ("reply", Some(*id)),
+                    ServerFrame::Event { .. } => ("event", None),
+                };
+                if first_write {
+                    log::debug!(
+                        "[Tunnel] writer first_write_begin client_id={client_id} peer={peer:?} writer_tid={writer_tid} frame_kind={frame_kind} request_id={request_id:?}"
+                    );
+                }
+                if let Err(error) = hsr_ipc::write_json_frame(&mut socket, &frame) {
+                    log::warn!(
+                        "[Tunnel] writer write_failed client_id={client_id} peer={peer:?} writer_tid={writer_tid} frame_kind={frame_kind} request_id={request_id:?} first_write={first_write}: {error:#}"
+                    );
+                    break;
+                }
+                if first_write {
+                    log::debug!(
+                        "[Tunnel] writer first_write_complete client_id={client_id} peer={peer:?} writer_tid={writer_tid} frame_kind={frame_kind} request_id={request_id:?}"
+                    );
+                    first_write = false;
+                }
             }
-        }
-        writer_alive.store(false, Ordering::SeqCst);
-    });
+        }),
+    ) {
+        Ok(writer) => writer,
+        Err(_) => return,
+    };
 
     log::debug!("[Tunnel] client {client_id} connected");
 
-    let mut socket = stream;
+    let mut socket = ConnectionReader(&state);
     loop {
         let frame: ClientFrame = match hsr_ipc::read_json_frame(&mut socket) {
             Ok(frame) => frame,
             Err(_) => break,
         };
 
-        if !alive.load(Ordering::SeqCst) {
+        if !state.alive.load(Ordering::SeqCst) {
             break;
         }
 
@@ -201,17 +314,67 @@ fn handle_connection(stream: TcpStream) {
             ClientFrame::Command { id, command } => {
                 let responder = Responder {
                     id,
+                    client_id,
                     out: out_tx.clone(),
                 };
-                thread::spawn(move || handle_command(&responder, command));
+                let failed_responder = responder.clone();
+                let action = dumper_action(&command);
+                if let Some(action) = action {
+                    log::debug!(
+                        "[Tunnel] dumper request client_id={client_id} request_id={id} peer={peer:?} action={action:?}"
+                    );
+                }
+                let Some(permit) = COMMAND_BUDGET.try_acquire() else {
+                    log::warn!(
+                        "[Tunnel] command admission failed client_id={client_id} request_id={id} peer={peer:?}: thread limit {COMMAND_THREAD_LIMIT}"
+                    );
+                    if let Some(action) = action {
+                        responder.reply_dumper(BackendEvent::DumperFailed {
+                            action,
+                            error: format!("IPC command thread limit ({COMMAND_THREAD_LIMIT}) reached; retry after a running command finishes"),
+                        });
+                    }
+                    continue;
+                };
+                if let Err(error) = spawn_thread(
+                    spawner,
+                    SpawnContext {
+                        role: "command",
+                        client_id: Some(client_id),
+                        request_id: Some(id),
+                        peer,
+                    },
+                    Box::new(move || {
+                        let _permit = permit;
+                        handle_command(&responder, command);
+                    }),
+                ) {
+                    if let Some(action) = action {
+                        failed_responder.reply_dumper(BackendEvent::DumperFailed {
+                            action,
+                            error: format!("IPC command thread spawn failed: {error}"),
+                        });
+                    }
+                }
             }
         }
     }
 
-    unregister_client(client_id);
+    state.close();
     drop(out_tx);
-    let _ = writer.join();
+    // Do not wait on a writer that may still be completing a socket write.
+    if writer.is_finished() {
+        let _ = writer.join();
+    }
     log::debug!("[Tunnel] client {client_id} disconnected");
+}
+
+fn dumper_action(command: &FrontendCommand) -> Option<DumperAction> {
+    match command {
+        FrontendCommand::Dumper(DumperCommand::Run { action })
+        | FrontendCommand::RunDumper { action } => Some(*action),
+        _ => None,
+    }
 }
 
 fn handle_command(responder: &Responder, command: FrontendCommand) {
@@ -275,8 +438,9 @@ fn run_dumper(
 
     let Some(_guard) = gate.try_enter() else {
         log::warn!(
-            "[Tunnel] reject dumper {}: another dump is still running",
-            action.label()
+            "[Tunnel] reject dumper client_id={} request_id={} action={action:?}: another dump is still running",
+            responder.client_id,
+            responder.id
         );
         responder.reply_dumper(BackendEvent::DumperFailed {
             action,
@@ -284,18 +448,30 @@ fn run_dumper(
         });
         return;
     };
-    log::debug!("[Tunnel] run dumper: {action:?}");
+    log::debug!(
+        "[Tunnel] run dumper client_id={} request_id={} action={action:?} ownership=acquired",
+        responder.client_id,
+        responder.id
+    );
     let start = Instant::now();
     responder.reply_dumper(BackendEvent::DumperStarted { action });
 
     match catch_unwind(AssertUnwindSafe(run)) {
         Ok(Ok(())) => {
             let seconds = start.elapsed().as_secs();
-            log::debug!("[Tunnel] dumper finished: {} ({seconds}s)", action.label());
+            log::debug!(
+                "[Tunnel] dumper finished client_id={} request_id={} action={action:?} ({seconds}s)",
+                responder.client_id,
+                responder.id
+            );
             responder.reply_dumper(BackendEvent::DumperFinished { action, seconds });
         }
         Ok(Err(error)) => {
-            log::debug!("[Tunnel] dumper failed: {}: {error:#}", action.label());
+            log::debug!(
+                "[Tunnel] dumper failed client_id={} request_id={} action={action:?}: {error:#}",
+                responder.client_id,
+                responder.id
+            );
             responder.reply_dumper(BackendEvent::DumperFailed {
                 action,
                 error: format!("{error:#}"),
@@ -309,7 +485,11 @@ fn run_dumper(
             } else {
                 "unknown panic payload".to_string()
             };
-            log::error!("[Tunnel] dumper panicked: {}: {message}", action.label());
+            log::error!(
+                "[Tunnel] dumper panicked client_id={} request_id={} action={action:?}: {message}",
+                responder.client_id,
+                responder.id
+            );
             responder.reply_dumper(BackendEvent::DumperFailed {
                 action,
                 error: format!("internal dumper panic: {message}"),
@@ -503,6 +683,9 @@ fn handle_config(responder: &Responder, command: ConfigCommand) {
 }
 
 #[cfg(test)]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod dumper_tests {
     use super::*;
 
@@ -528,7 +711,11 @@ mod dumper_tests {
         for action in actions {
             let gate = task_gate::TaskGate::new();
             let (out, rx) = mpsc::sync_channel(8);
-            let responder = Responder { id: 7, out };
+            let responder = Responder {
+                id: 7,
+                client_id: 0,
+                out,
+            };
             run_dumper(&responder, action, &gate, || panic!("broken field"));
             assert!(
                 matches!(response(&rx), BackendEvent::DumperStarted { action: a } if a == action)
@@ -558,7 +745,11 @@ mod dumper_tests {
         let gate = task_gate::TaskGate::new();
         let _guard = gate.try_enter().unwrap();
         let (out, rx) = mpsc::sync_channel(8);
-        let responder = Responder { id: 7, out };
+        let responder = Responder {
+            id: 7,
+            client_id: 0,
+            out,
+        };
         run_dumper(&responder, DumperAction::Resources, &gate, || {
             panic!("must not run")
         });
@@ -573,7 +764,11 @@ mod dumper_tests {
         for action in DumperAction::ALL {
             let gate = task_gate::TaskGate::new();
             let (out, rx) = mpsc::sync_channel(8);
-            let responder = Responder { id: 7, out };
+            let responder = Responder {
+                id: 7,
+                client_id: 0,
+                out,
+            };
             run_dumper(&responder, action, &gate, || Ok(()));
             assert!(
                 matches!(response(&rx), BackendEvent::DumperStarted { action: a } if a == action)
@@ -588,7 +783,11 @@ mod dumper_tests {
     #[test]
     fn terminal_reply_waits_for_queue_space_instead_of_dropping() {
         let (out, rx) = mpsc::sync_channel(1);
-        let responder = Responder { id: 7, out };
+        let responder = Responder {
+            id: 7,
+            client_id: 0,
+            out,
+        };
         responder.reply(BackendEvent::DumperStarted {
             action: DumperAction::Resources,
         });
