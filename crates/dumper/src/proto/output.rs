@@ -98,12 +98,7 @@ impl Message {
         result.push('\n');
 
         for nested in &self.children {
-            if let ProtoItem::Enum(en) = &*nested.borrow()
-                && self
-                    .oneofs
-                    .iter()
-                    .any(|v| v.fields.len() == en.variants.len().saturating_sub(1))
-            {
+            if is_omitted_oneof_discriminator(self, &nested.borrow()) {
                 continue; // Skip enum for oneof
             }
 
@@ -159,6 +154,16 @@ impl Message {
 
         result
     }
+}
+
+pub(super) fn is_omitted_oneof_discriminator(message: &Message, item: &ProtoItem) -> bool {
+    let ProtoItem::Enum(enumeration) = item else {
+        return false;
+    };
+    message
+        .oneofs
+        .iter()
+        .any(|oneof| oneof.fields.len() == enumeration.variants.len().saturating_sub(1))
 }
 
 impl Enum {
@@ -487,7 +492,7 @@ pub fn generate_protobuf<W: Write>(
     method_nt_map: &HashMap<String, String>,
     predeobf_map: &HashMap<String, String>,
     scoped_field_names: &super::names::ScopedFieldNames,
-    mut out: W,
+    out: W,
 ) -> std::io::Result<(HashMap<i32, String>, HashMap<String, String>, TypeToItemMap)> {
     let mut type_to_item: TypeToItemMap = IndexMap::new();
 
@@ -772,6 +777,15 @@ pub fn generate_protobuf<W: Write>(
     }
     rename_packet_ids(&mut cmd_ids, &accepted_types);
 
+    write_protobuf(&type_to_item, out)?;
+
+    Ok((cmd_ids, accepted_types, type_to_item))
+}
+
+pub(super) fn write_protobuf<W: Write>(
+    type_to_item: &TypeToItemMap,
+    mut out: W,
+) -> std::io::Result<()> {
     writeln!(
         out,
         "syntax = \"proto3\"; // ex-RushiaLover ProtoDumper | Game Version: {}\n",
@@ -794,6 +808,5 @@ pub fn generate_protobuf<W: Write>(
         }
         writeln!(out, "{}", proto.fmt_protobuf_with_depth(0))?;
     }
-
-    Ok((cmd_ids, accepted_types, type_to_item))
+    Ok(())
 }

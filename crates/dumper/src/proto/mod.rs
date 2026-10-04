@@ -15,6 +15,7 @@ use il2cpp::{
 use reflection::{property_info::PropertyInfo, runtime_type::RuntimeType};
 use utils::game_assembly_slice;
 
+mod accepted_names;
 mod asm_address;
 mod cache;
 mod call_argument_names;
@@ -447,6 +448,11 @@ pub enum ProtoDumpMode {
 }
 
 #[allow(unused)]
+pub fn validate_accepted_names() -> io::Result<()> {
+    accepted_names::validate_embedded().map_err(io::Error::other)
+}
+
+#[allow(unused)]
 pub fn dump<W: Write>(
     out: &mut W,
     cmdid_out: &mut W,
@@ -783,7 +789,7 @@ fn dump_inner<W: Write>(
     log::debug!("[Proto Dumper] generating protobuf...");
     progress.stage("write protobuf", minimal_info_map.len());
 
-    let (cmd_ids_final, nt_map_final, final_items) = output::generate_protobuf(
+    let (mut cmd_ids_final, _, mut final_items) = output::generate_protobuf(
         &type_cache,
         &minimal_info_map,
         &rsp_notify_map,
@@ -792,8 +798,14 @@ fn dump_inner<W: Write>(
         &logic_names.types,
         &logic_names.fields,
         &field_metadata.names,
-        out,
+        std::io::sink(),
     )?;
+    progress.stage("apply accepted structural names", final_items.len());
+    let accepted_application = accepted_names::apply_embedded(&mut final_items, &mut cmd_ids_final)
+        .map_err(io::Error::other)?;
+    let nt_map_final = accepted_application.type_aliases;
+    let accepted_name_report = accepted_application.report;
+    output::write_protobuf(&final_items, out)?;
 
     progress.stage("write field name evidence", field_metadata.evidence.len());
     field_metadata.write(
@@ -805,6 +817,13 @@ fn dump_inner<W: Write>(
         std::path::Path::new("./DUMP/proto-sync-field-evidence.json"),
     )?;
     gateway_names.write(&final_items)?;
+    progress.stage("write accepted-name evidence", 0);
+    let mut accepted_name_report = serde_json::to_vec_pretty(&accepted_name_report)?;
+    accepted_name_report.push(b'\n');
+    std::fs::write(
+        "./DUMP/proto-accepted-name-evidence.json",
+        accepted_name_report,
+    )?;
 
     names::rename_handler_keys(&mut cs_type_infos, &nt_map_final);
     names::rename_handler_keys(&mut sc_packet_handlers, &nt_map_final);

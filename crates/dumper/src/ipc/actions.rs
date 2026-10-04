@@ -3,7 +3,11 @@ use std::path::Path;
 use anyhow::Context;
 use hsr_ipc::{DumperAction, ProtoDumpMode};
 
-use crate::{csharp, parser_data, proto, res, runtime, script, script_v2};
+use crate::{
+    csharp, parser_data, proto, res, runtime,
+    runtime_logs::{self, RuntimeLogPhase},
+    script, script_v2,
+};
 
 pub fn run(action: DumperAction) -> anyhow::Result<()> {
     ensure_dump_folder()?;
@@ -49,15 +53,40 @@ fn prepare_script_metadata(consumer: &str) -> anyhow::Result<()> {
 }
 
 fn dump_proto(mode: ProtoDumpMode) -> anyhow::Result<()> {
-    prepare_script_metadata("Proto")?;
-    log::info!("[Proto Dumper] starting mode {mode:?}");
-    proto::dump(
-        &mut std::fs::File::create("./DUMP/StarRail.proto")?,
-        &mut std::fs::File::create("./DUMP/packetIds.json")?,
-        map_proto_mode(mode),
-        false,
-    )?;
-    Ok(())
+    let capture_run_id = runtime_logs::new_capture_run_id();
+    capture_runtime_logs(RuntimeLogPhase::BeforeProtoExport, &capture_run_id);
+    let result = (|| -> anyhow::Result<()> {
+        proto::validate_accepted_names().context("built-in accepted Proto names")?;
+        prepare_script_metadata("Proto")?;
+        log::info!("[Proto Dumper] starting mode {mode:?}");
+        proto::dump(
+            &mut std::fs::File::create("./DUMP/StarRail.proto")?,
+            &mut std::fs::File::create("./DUMP/packetIds.json")?,
+            map_proto_mode(mode),
+            false,
+        )?;
+        Ok(())
+    })();
+    capture_runtime_logs(RuntimeLogPhase::AfterProtoExport, &capture_run_id);
+    result
+}
+
+fn capture_runtime_logs(phase: RuntimeLogPhase, capture_run_id: &str) {
+    let path = Path::new("./DUMP").join(phase.file_name());
+    let latest_path = Path::new("./DUMP/runtime-log-evidence.json");
+    match runtime_logs::dump(&path, latest_path, phase, capture_run_id) {
+        Ok(summary) => log::info!(
+            "[Runtime Logs] {}: status={} entries={} protocol_candidates={}",
+            phase.label(),
+            summary.status,
+            summary.entry_count,
+            summary.proto_candidate_count
+        ),
+        Err(error) => log::warn!(
+            "[Runtime Logs] {}: unavailable; phase report attempted: {error:#}",
+            phase.label()
+        ),
+    }
 }
 
 fn map_proto_mode(mode: ProtoDumpMode) -> proto::ProtoDumpMode {

@@ -1,6 +1,5 @@
 //! Apply recovered names as a single, checked step. A rejected name never
 //! changes the field tag, type, offset, or oneof membership.
-use convert_case::{Case, Casing};
 use std::collections::{HashMap, HashSet};
 
 use super::output::{ProtoItem, TypeToItemMap, short_name, snake_field};
@@ -57,6 +56,23 @@ pub(super) fn field_name_key(name: &str) -> String {
         .collect()
 }
 
+pub(super) fn protox_map_entry_name(field_name: &str) -> String {
+    let mut result = String::with_capacity(field_name.len() + "Entry".len());
+    let mut uppercase_next = true;
+    for ch in field_name.chars() {
+        if ch == '_' {
+            uppercase_next = true;
+        } else if uppercase_next {
+            result.push(ch.to_ascii_uppercase());
+            uppercase_next = false;
+        } else {
+            result.push(ch);
+        }
+    }
+    result.push_str("Entry");
+    result
+}
+
 fn message_symbols(message: &super::output::Message) -> HashSet<String> {
     let mut symbols: HashSet<_> = message
         .fields
@@ -72,10 +88,7 @@ fn message_symbols(message: &super::output::Message) -> HashSet<String> {
     );
     for field in &message.fields {
         if field.kind.starts_with("map<") {
-            symbols.insert(format!(
-                "{}Entry",
-                display_field(&field.name).to_case(Case::Pascal)
-            ));
+            symbols.insert(protox_map_entry_name(&display_field(&field.name)));
         }
     }
     symbols
@@ -157,7 +170,7 @@ pub(super) fn apply_field_maps(
                 let display = display_field(name);
                 let map_entry_conflict = message.fields.get(index).is_some_and(|f| {
                     f.kind.starts_with("map<")
-                        && reserved.contains(&format!("{}Entry", display.to_case(Case::Pascal)))
+                        && reserved.contains(&protox_map_entry_name(&display))
                 });
                 if !identifier(&display)
                     || counts[&field_name_key(&display)] > 1
@@ -220,21 +233,18 @@ pub(super) fn apply_field_maps(
 struct TypeName {
     original: String,
     local: String,
+    display: String,
     proposed: String,
     parent: Option<usize>,
 }
 
-fn type_path(index: usize, records: &[TypeName], renamed: bool) -> String {
+fn type_path(index: usize, records: &[TypeName], name: fn(&TypeName) -> &str) -> String {
     let record = &records[index];
-    let name = if renamed {
-        &record.proposed
-    } else {
-        &record.local
-    };
+    let local = name(record);
     if let Some(parent) = record.parent {
-        format!("{}.{}", type_path(parent, records, renamed), name)
+        format!("{}.{}", type_path(parent, records, name), local)
     } else {
-        name.clone()
+        local.to_owned()
     }
 }
 
@@ -275,13 +285,14 @@ pub fn apply_type_names(
             TypeName {
                 original: name.clone(),
                 local: local.clone(),
+                display: short_name(recovered.as_deref().unwrap_or(name)).to_owned(),
                 proposed: proposal.map(|s| short_name(s).to_owned()).unwrap_or(local),
                 parent: parents.get(&i).copied(),
             }
         })
         .collect();
     for index in 0..records.len() {
-        let old_path = type_path(index, &records, false);
+        let old_path = type_path(index, &records, |record| &record.local);
         if records[index].proposed == records[index].local
             && let Some(candidate) = names.get(&old_path)
         {
@@ -342,9 +353,11 @@ pub fn apply_type_names(
     let mut ambiguous = HashSet::new();
     let mut applied = 0;
     for (i, record) in records.iter().enumerate() {
-        let final_path = type_path(i, &records, true);
-        let old_path = type_path(i, &records, false);
-        for alias in [&record.original, &record.local, &old_path] {
+        let final_path = type_path(i, &records, |record| &record.proposed);
+        let old_path = type_path(i, &records, |record| &record.local);
+        // References may already use names accepted by an earlier pass.
+        let display_path = type_path(i, &records, |record| &record.display);
+        for alias in [&record.original, &record.local, &old_path, &display_path] {
             if let Some(previous) = aliases.insert(alias.clone(), final_path.clone())
                 && previous != final_path
             {
@@ -509,6 +522,104 @@ mod tests {
     }
 
     #[test]
+    fn second_pass_parent_rename_updates_previously_renamed_nested_references() {
+        let mut parent = message("P");
+        let mut child = message("B");
+        child.has_parent = true;
+        let child = Rc::new(RefCell::new(ProtoItem::Message(child)));
+        let enumeration = Rc::new(RefCell::new(ProtoItem::Enum(Enum {
+            name: "E".into(),
+            deobfuscated_name: None,
+            variants: vec![("STATUS_UNSPECIFIED".into(), 0)],
+            has_parent: true,
+        })));
+        parent.children = vec![child.clone(), enumeration.clone()];
+        let kinds = [
+            "Proto.P.B",
+            "Proto.P.E",
+            "repeated Proto.P.B",
+            "repeated Proto.P.E",
+            "map<uint32, Proto.P.B>",
+            "map<uint32, Proto.P.E>",
+            "Proto.P.B",
+            "Proto.P.E",
+        ];
+        let mut fields = kinds.iter().enumerate().map(|(index, kind)| Field {
+            kind: (*kind).into(),
+            ..field(&format!("field_{}", index + 1), index as u32 + 1)
+        });
+        parent.fields = fields.by_ref().take(6).collect();
+        parent.oneofs = vec![OneOf {
+            name: "Choice".into(),
+            fields: fields.collect(),
+        }];
+        let mut items = items(parent);
+        items.insert(RuntimeType(2), child);
+        items.insert(RuntimeType(3), enumeration);
+
+        for (names, parent_name) in [
+            (
+                HashMap::from([("B".into(), "Info".into()), ("E".into(), "Status".into())]),
+                "P",
+            ),
+            (
+                HashMap::from([("P".into(), "NamedParent".into())]),
+                "NamedParent",
+            ),
+        ] {
+            let accepted = apply_type_names(&mut items, &names);
+            let item = items[&RuntimeType(1)].borrow();
+            let ProtoItem::Message(parent) = &*item else {
+                panic!()
+            };
+            let expected = [
+                format!("{parent_name}.Info"),
+                format!("{parent_name}.Status"),
+                format!("repeated {parent_name}.Info"),
+                format!("repeated {parent_name}.Status"),
+                format!("map<uint32, {parent_name}.Info>"),
+                format!("map<uint32, {parent_name}.Status>"),
+                format!("{parent_name}.Info"),
+                format!("{parent_name}.Status"),
+            ];
+            for (index, (field, kind)) in parent
+                .fields
+                .iter()
+                .chain(parent.oneofs.iter().flat_map(|o| o.fields.iter()))
+                .zip(expected)
+                .enumerate()
+            {
+                assert_eq!(field.kind, kind);
+                assert_eq!(field.name, format!("field_{}", index + 1));
+                assert_eq!(field.number, index as u32 + 1);
+                assert_eq!(field.offset, (index as u32 + 1) * 8);
+            }
+            assert_eq!(parent.name, "P");
+            assert_eq!(parent.oneofs[0].name, "Choice");
+            assert_eq!(accepted["B"], format!("{parent_name}.Info"));
+            assert_eq!(accepted["E"], format!("{parent_name}.Status"));
+            if parent_name == "NamedParent" {
+                assert_eq!(parent.deobfuscated_name.as_deref(), Some("NamedParent"));
+                assert_eq!(accepted["P.Info"], "NamedParent.Info");
+                assert_eq!(accepted["P.Status"], "NamedParent.Status");
+            }
+        }
+        let child = items[&RuntimeType(2)].borrow();
+        let ProtoItem::Message(child) = &*child else {
+            panic!()
+        };
+        assert_eq!(child.name, "B");
+        assert_eq!(child.deobfuscated_name.as_deref(), Some("Info"));
+        let enumeration = items[&RuntimeType(3)].borrow();
+        let ProtoItem::Enum(enumeration) = &*enumeration else {
+            panic!()
+        };
+        assert_eq!(enumeration.name, "E");
+        assert_eq!(enumeration.deobfuscated_name.as_deref(), Some("Status"));
+        assert_eq!(enumeration.variants, [("STATUS_UNSPECIFIED".into(), 0)]);
+    }
+
+    #[test]
     fn duplicate_type_proposals_do_not_change_definitions_or_references() {
         let mut a = message("AAAAAAAAAAA");
         a.fields.push(Field {
@@ -534,6 +645,58 @@ mod tests {
             panic!()
         };
         assert_eq!(m.fields[0].kind, "BBBBBBBBBBB");
+    }
+
+    #[test]
+    fn uppercase_map_entry_blocks_nested_type_alias() {
+        let mut parent = message("PPPPPPPPPPP");
+        parent.fields.push(Field {
+            kind: "map<string, uint32>".into(),
+            ..field("HEDHGPKEGBI", 1)
+        });
+        let mut child = message("CCCCCCCCCCC");
+        child.has_parent = true;
+        let child = Rc::new(RefCell::new(ProtoItem::Message(child)));
+        parent.children.push(child.clone());
+        let mut items = items(parent);
+        items.insert(RuntimeType(2), child);
+
+        apply_type_names(
+            &mut items,
+            &HashMap::from([("CCCCCCCCCCC".into(), "HEDHGPKEGBIEntry".into())]),
+        );
+
+        let item = items[&RuntimeType(2)].borrow();
+        let ProtoItem::Message(child) = &*item else {
+            panic!()
+        };
+        assert_eq!(child.deobfuscated_name, None);
+    }
+
+    #[test]
+    fn uppercase_map_field_alias_cannot_shadow_nested_type() {
+        let mut parent = message("PPPPPPPPPPP");
+        parent.fields.push(Field {
+            kind: "map<string, uint32>".into(),
+            ..field("FFFFFFFFFFF", 1)
+        });
+        let mut child = message("HEDHGPKEGBIEntry");
+        child.has_parent = true;
+        let child = Rc::new(RefCell::new(ProtoItem::Message(child)));
+        parent.children.push(child.clone());
+        let mut items = items(parent);
+        items.insert(RuntimeType(2), child);
+
+        apply_global_field_map(
+            &mut items,
+            &HashMap::from([("FFFFFFFFFFF".into(), "HEDHGPKEGBI".into())]),
+        );
+
+        let item = items[&RuntimeType(1)].borrow();
+        let ProtoItem::Message(parent) = &*item else {
+            panic!()
+        };
+        assert_eq!(parent.fields[0].name, "FFFFFFFFFFF");
     }
 
     #[test]

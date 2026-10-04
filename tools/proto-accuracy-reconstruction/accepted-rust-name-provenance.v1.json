@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "dataset_id": "hsr-4.6.51-wave10-2026-10-04",
+  "generated_date": "2026-10-04",
+  "review_status": "approved",
+  "independent_review_sha256": "a81e23b98998d486cbee92bf9368e5ac8a64b8b1c686bb9a2b2251a69d0d13a7",
+  "accepted_ledger_sha256": "8567e763c96e4b609eabe70b04fa90925f195188c6ff8e73c527892b44818318",
+  "accepted_application_script_sha256": "9741df949c9c173b68080c12e5ac030c287b0de3d65bd7e3e6f47b8d5259c793",
+  "canonical_overrides": {
+    "GridFightTraitUpdateCsReq": "PHIFCNHKOAI"
+  },
+  "inputs": {
+    "raw_proto_sha256": "a51d18abc03d078c24b10447238a4feb435f272d59364b491ab0038f9f0dbdaf",
+    "accepted_proto_sha256": "13e54d35c89a289cb262614c9d6ab7648bb2ddcaeee326d468334796d64146f1",
+    "raw_packet_ids_sha256": "92ac1c51eb01993b5f27daf14006822146134e9e880beb0e1f714fb8fbc964d0",
+    "accepted_packet_ids_sha256": "c16a3f4d235d71a52150b4c6ec1fb89f951d2df2b7a6a7070b877d881daf4d77"
+  }
+}

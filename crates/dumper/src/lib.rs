@@ -16,6 +16,7 @@ mod parser_data;
 mod proto;
 mod res;
 mod runtime;
+mod runtime_logs;
 mod script;
 mod script_v2;
 mod version;

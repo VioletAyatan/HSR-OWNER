@@ -771,6 +771,116 @@ fn replay_dump() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "offline accepted-name replay; requires the reviewed 4.6.51 artifacts"]
+fn replay_builtin_accepted_names() -> Result<()> {
+    let directory = std::env::var_os("HSR_PROTO_REPLAY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/allocator-fh3-runtime-20261003-041926")
+        });
+    let accepted_proto = std::env::var_os("HSR_PROTO_ACCEPTED_PROTO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| directory.join("StarRail.accuracy.wave10.proto"));
+    let accepted_packets = std::env::var_os("HSR_PROTO_ACCEPTED_PACKETS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| directory.join("packetIds.accuracy.wave10.json"));
+
+    let mut current = parse_dump(&fs::read_to_string(directory.join("StarRail.proto"))?)?;
+    let accepted = parse_dump(&fs::read_to_string(&accepted_proto)?)?;
+    let mut packet_ids: HashMap<i32, String> =
+        serde_json::from_str(&fs::read_to_string(directory.join("packetIds.json"))?)?;
+    let expected_packet_ids: HashMap<i32, String> =
+        serde_json::from_str(&fs::read_to_string(&accepted_packets)?)?;
+
+    let application = super::accepted_names::apply_embedded(&mut current.items, &mut packet_ids)
+        .map_err(anyhow::Error::msg)?;
+    let report = serde_json::to_value(application.report)?;
+    for key in ["unresolved", "ambiguous", "conflicts"] {
+        ensure!(
+            report[key].as_array().is_some_and(Vec::is_empty),
+            "accepted-name replay reported {key}: {}",
+            report[key]
+        );
+    }
+    ensure!(
+        packet_ids == expected_packet_ids,
+        "built-in accepted names did not reproduce the reviewed packet IDs"
+    );
+
+    fn names(items: &TypeToItemMap) -> Vec<String> {
+        items
+            .values()
+            .map(|item| match &*item.borrow() {
+                ProtoItem::Message(message) => {
+                    let mut fields = message
+                        .fields
+                        .iter()
+                        .map(|field| format!("f:{}:{}:{}", field.number, field.name, field.kind))
+                        .collect::<Vec<_>>();
+                    for oneof in &message.oneofs {
+                        fields.push(format!(
+                            "o:{}:{}",
+                            oneof.name.strip_suffix("Case").unwrap_or(&oneof.name),
+                            oneof
+                                .fields
+                                .iter()
+                                .map(|field| format!(
+                                    "{}:{}:{}",
+                                    field.number, field.name, field.kind
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ));
+                    }
+                    format!(
+                        "m:{}:{}",
+                        message
+                            .deobfuscated_name
+                            .as_deref()
+                            .unwrap_or(&message.name),
+                        fields.join("|")
+                    )
+                }
+                ProtoItem::Enum(enumeration) => format!(
+                    "e:{}:{}",
+                    enumeration
+                        .deobfuscated_name
+                        .as_deref()
+                        .unwrap_or(&enumeration.name),
+                    enumeration
+                        .variants
+                        .iter()
+                        .map(|(name, number)| format!("{name}={number}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            })
+            .collect()
+    }
+
+    ensure!(
+        names(&current.items) == names(&accepted.items),
+        "built-in accepted names did not reproduce the reviewed Proto identifiers"
+    );
+    ensure!(
+        snapshot(&current.items) == snapshot(&accepted.items),
+        "built-in accepted names changed or failed to reproduce reviewed wire layout"
+    );
+
+    let rendered = format_dump(&current);
+    let output = std::env::temp_dir().join(format!(
+        "hsr-owner-accepted-names-{}.proto",
+        std::process::id()
+    ));
+    fs::write(&output, rendered)?;
+    let compile_result = protox::compile([&output], [output.parent().unwrap()]);
+    let _ = fs::remove_file(&output);
+    compile_result.context("accepted-name replay failed frontend-compatible compilation")?;
+    Ok(())
+}
+
 fn obfuscated_enums(items: &TypeToItemMap) -> usize {
     items
         .values()
