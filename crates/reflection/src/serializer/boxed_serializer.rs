@@ -139,6 +139,7 @@ pub struct BoxedSerializer {
     callbacks: Callback,
     fields_only: bool,
     default_value_as_null: bool,
+    omit_native_pointers: bool,
     checkpoint: Option<Box<dyn FnMut() -> Result<()>>>,
     checkpoint_visits: usize,
     serialization_depth: usize,
@@ -158,6 +159,13 @@ impl BoxedSerializer {
             enum_as_value,
             ..Default::default()
         }
+    }
+
+    /// Write IntPtr/UIntPtr values (native handles such as UnityEngine.Object.m_Ptr)
+    /// as null. They are process addresses, so exporting them makes data dumps
+    /// differ between runs without carrying any game data.
+    pub fn set_omit_native_pointers(&mut self, omit: bool) {
+        self.omit_native_pointers = omit;
     }
 
     /// Installs a callback invoked every 256 recursive serialization visits.
@@ -321,6 +329,7 @@ impl BoxedSerializer {
             }};
         }
 
+        let omit_native_pointers = self.omit_native_pointers;
         Ok(match self.type_name(ty)?.as_str() {
             "String" => {
                 let s = Il2CppString(object.0).as_str().into_owned();
@@ -333,6 +342,7 @@ impl BoxedSerializer {
             "UInt16" => handle_primitive!(u16, |v: u16| Value::Number(v.into())),
             "Int32" => handle_primitive!(i32, |v: i32| Value::Number(v.into())),
             "UInt32" => handle_primitive!(u32, |v: u32| Value::Number(v.into())),
+            "IntPtr" | "UIntPtr" if omit_native_pointers => Value::Null,
             "Int64" | "IntPtr" => handle_primitive!(i64, |v: i64| Value::Number(v.into())),
             "UInt64" | "UIntPtr" => handle_primitive!(u64, |v: u64| Value::Number(v.into())),
             "Single" => handle_primitive!(f32, |v: f32| json!(v)),
@@ -854,6 +864,7 @@ mod checkpoint_tests {
             callbacks: HashMap::new(),
             fields_only: false,
             default_value_as_null: false,
+            omit_native_pointers: false,
             checkpoint: None,
             checkpoint_visits: 0,
             serialization_depth: 0,

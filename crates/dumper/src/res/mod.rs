@@ -160,6 +160,7 @@ fn write_json(path: &std::path::Path, value: &impl serde::Serialize) -> Result<(
 fn new_serializer() -> reflection::serializer::BoxedSerializer {
     let mut serializer = reflection::serializer::BoxedSerializer::default();
     serializer.set_checkpoint(Box::new(diagnostics::check_memory));
+    serializer.set_omit_native_pointers(true);
     serializer
 }
 

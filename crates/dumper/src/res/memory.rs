@@ -13,6 +13,7 @@ const MIB: u64 = 1024 * 1024;
 const PRIVATE_LIMIT: u64 = 16 * 1024 * MIB;
 const COMMIT_RESERVE: u64 = 2 * 1024 * MIB;
 const MIN_PHYSICAL_RESERVE: u64 = 1024 * MIB;
+const PHYSICAL_HYSTERESIS: u64 = 256 * MIB;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Snapshot {
@@ -58,21 +59,27 @@ impl Snapshot {
         )
     }
 
+    /// Stop only on conditions that predict allocation failure. Low available
+    /// physical RAM means paging, not failure: Windows still satisfies commits,
+    /// and other processes (frontend, server) routinely hold most of it.
     fn check(self) -> Result<()> {
-        let physical_reserve = MIN_PHYSICAL_RESERVE.max(self.total_physical / 20);
-        if self.private_bytes >= PRIVATE_LIMIT
-            || self.available_commit <= COMMIT_RESERVE
-            || self.available_physical <= physical_reserve
-        {
+        if self.private_bytes >= PRIVATE_LIMIT || self.available_commit <= COMMIT_RESERVE {
             bail!(
-                "Resources memory limit reached; cooperative stop requested: {} (private_limit_mib={}, commit_reserve_mib={}, physical_reserve_mib={}); partial output retained; game memory is not forcibly collected",
+                "Resources memory limit reached; cooperative stop requested: {} (private_limit_mib={}, commit_reserve_mib={}); partial output retained; game memory is not forcibly collected",
                 self.summary(),
                 PRIVATE_LIMIT / MIB,
-                COMMIT_RESERVE / MIB,
-                physical_reserve / MIB
+                COMMIT_RESERVE / MIB
             );
         }
         Ok(())
+    }
+
+    fn physical_reserve(self) -> u64 {
+        MIN_PHYSICAL_RESERVE.max(self.total_physical / 20)
+    }
+
+    fn physical_low(self) -> bool {
+        self.available_physical <= self.physical_reserve()
     }
 }
 
@@ -80,6 +87,7 @@ struct State {
     sampled: Instant,
     snapshot: Snapshot,
     failure: Option<String>,
+    physical_low: bool,
 }
 
 pub(super) struct Monitor(Mutex<State>);
@@ -98,6 +106,7 @@ impl Monitor {
             sampled: Instant::now(),
             snapshot,
             failure: None,
+            physical_low: false,
         })))
     }
 
@@ -115,6 +124,28 @@ impl Monitor {
                 snapshot.check()
             });
             state.sampled = Instant::now();
+            // Log transitions only (with hysteresis); sampling runs every 100 ms.
+            let snapshot = state.snapshot;
+            let physical_low = if state.physical_low {
+                snapshot.available_physical <= snapshot.physical_reserve() + PHYSICAL_HYSTERESIS
+            } else {
+                snapshot.physical_low()
+            };
+            if physical_low != state.physical_low {
+                state.physical_low = physical_low;
+                if physical_low {
+                    log::warn!(
+                        "[Resources memory] low available physical memory; continuing while commit is available (paging may slow the dump): {} physical_reserve_mib={}",
+                        state.snapshot.summary(),
+                        state.snapshot.physical_reserve() / MIB
+                    );
+                } else {
+                    log::info!(
+                        "[Resources memory] available physical memory recovered: {}",
+                        state.snapshot.summary()
+                    );
+                }
+            }
             if let Err(error) = result {
                 let message = format!("{error:#}");
                 if state.failure.is_none() {
@@ -180,27 +211,23 @@ mod tests {
     }
 
     #[test]
-    fn physical_pressure_stops_even_with_plenty_of_commit() {
+    fn physical_pressure_is_reported_but_does_not_stop_while_commit_is_available() {
+        // Values observed when the in-game run was falsely stopped.
         let mut snapshot = Snapshot {
-            private_bytes: 10 * 1024 * MIB,
-            working_set: 9 * 1024 * MIB,
-            available_commit: 24 * 1024 * MIB,
-            available_physical: MIN_PHYSICAL_RESERVE,
-            total_physical: 16 * 1024 * MIB,
+            private_bytes: 5318 * MIB,
+            working_set: 3437 * MIB,
+            available_commit: 8445 * MIB,
+            available_physical: 1021 * MIB,
+            total_physical: 16125 * MIB,
         };
-        assert!(
-            snapshot
-                .check()
-                .unwrap_err()
-                .to_string()
-                .contains("physical_reserve_mib=1024")
-        );
-        snapshot.available_physical += 1;
+        assert!(snapshot.physical_low());
         assert!(snapshot.check().is_ok());
+        snapshot.available_physical = MIN_PHYSICAL_RESERVE + 1;
+        assert!(!snapshot.physical_low());
         snapshot.total_physical = 64 * 1024 * MIB;
         snapshot.available_physical = snapshot.total_physical / 20;
+        assert!(snapshot.physical_low());
+        snapshot.available_commit = COMMIT_RESERVE;
         assert!(snapshot.check().is_err());
-        snapshot.available_physical += 1;
-        assert!(snapshot.check().is_ok());
     }
 }

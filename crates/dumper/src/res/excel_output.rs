@@ -43,6 +43,11 @@ fn dump_table(table: RuntimeType) -> Result<()> {
     for path in paths {
         ensure!(path.0 != 0, "{name}: null path in path list");
         let path = path.as_str();
+        // A blank entry would publish "ExcelOutput/.json"; it names no table file.
+        if path.trim().is_empty() {
+            super::checkpoint(format!("ExcelOutput: skip {name} blank path {path:?}"));
+            continue;
+        }
         // Preserve runtime-table semantics. Do not unload/reload shared game tables.
         let output_name = path.rsplit('/').next().unwrap_or(&path);
         let output_name = output_name.strip_suffix(".bytes").unwrap_or(output_name);
