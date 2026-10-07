@@ -7,6 +7,7 @@ use il2cpp::{
 use reflection::{method_info::MethodInfo, serializer::BoxedSerializer};
 use std::{collections::BTreeMap, path::PathBuf};
 
+mod character;
 mod level_output_floor;
 mod mission;
 mod rogue_chest_map;
@@ -49,6 +50,9 @@ pub fn dump() -> Result<()> {
         rogue_chest_map::dump(&mut serializer)
     })?;
     operation("Config/Mission", || mission::dump(&mut serializer))?;
+    operation("Config/ConfigCharacter", || {
+        character::dump(&mut serializer)
+    })?;
     Ok(())
 }
 
