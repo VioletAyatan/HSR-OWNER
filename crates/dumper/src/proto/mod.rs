@@ -38,6 +38,7 @@ mod replay_tests;
 mod rsp_scan;
 mod sync_fields;
 mod sync_scan;
+mod token_names;
 pub mod util;
 mod write_to;
 mod xlua_enum;
@@ -801,11 +802,24 @@ fn dump_inner<W: Write>(
         std::io::sink(),
     )?;
     progress.stage("apply accepted structural names", final_items.len());
+    let client_field_names = token_names::snapshot(&final_items);
     let accepted_application = accepted_names::apply_embedded(&mut final_items, &mut cmd_ids_final)
         .map_err(io::Error::other)?;
     let nt_map_final = accepted_application.type_aliases;
     let accepted_name_report = accepted_application.report;
+    // Last naming step: check accepted aliases against client names by token,
+    // then name same-token fields in other messages.
+    progress.stage("propagate field names by token", final_items.len());
+    let token_report = token_names::propagate(
+        &type_to_item,
+        &RETCODE_FIELD_NAME,
+        &client_field_names,
+        &mut final_items,
+    );
     output::write_protobuf(&final_items, out)?;
+    let mut token_report = serde_json::to_vec_pretty(&token_report)?;
+    token_report.push(b'\n');
+    std::fs::write("./DUMP/proto-token-propagation-evidence.json", token_report)?;
 
     progress.stage("write field name evidence", field_metadata.evidence.len());
     field_metadata.write(
