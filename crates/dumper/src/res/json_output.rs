@@ -1,12 +1,51 @@
 use anyhow::{Context, Result};
 use std::{
+    collections::HashSet,
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
+
+/// Destinations published by the current Resources session (normalized keys).
+static PUBLISHED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Key a destination the way Win32 names it on disk: `/` separators, ASCII
+/// case-insensitive, and trailing dots/spaces stripped from every component
+/// (`CreateFileW` drops them, so `Act1.json ` and `Act1.json` are one file).
+fn publish_key(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    text.trim_start_matches("./")
+        .split('/')
+        .map(|component| component.trim_end_matches([' ', '.']))
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_ascii_lowercase()
+}
+
+/// Start a fresh registry; called once per Resources session.
+pub(super) fn reset_published() {
+    *PUBLISHED.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashSet::new());
+}
+
+pub(super) fn is_published(path: &Path) -> bool {
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&publish_key(path)))
+}
+
+fn record_published(path: &Path) {
+    if let Some(set) = PUBLISHED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        set.insert(publish_key(path));
+    }
+}
 
 struct PendingFile(PathBuf);
 impl Drop for PendingFile {
@@ -38,7 +77,15 @@ fn write_file<T>(path: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Result
         .with_context(|| format!("flush {}", pending.0.display()))?;
     drop(writer);
     std::fs::rename(&pending.0, path).with_context(|| format!("publish {}", path.display()))?;
+    record_published(path);
     Ok(result)
+}
+
+/// Publish raw bytes (undecoded DesignData entries).
+pub(super) fn bytes(path: &Path, data: &[u8]) -> Result<()> {
+    write_file(path, |writer| {
+        writer.write_all(data).context("write raw bytes")
+    })
 }
 
 pub(super) fn value(path: &Path, value: &impl serde::Serialize) -> Result<()> {
@@ -89,6 +136,24 @@ pub(super) fn rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publish_keys_follow_win32_trailing_space_and_dot_stripping() {
+        // The runtime catalog names some Rogue dialogue acts with a trailing
+        // space; Win32 writes them to the stripped name, so the DesignData
+        // step must see the stripped name as already published.
+        let runtime = Path::new("./DUMP/Resources/Config/Level/Rogue/Event1/Act1.json ");
+        let index = Path::new("./DUMP/Resources/Config/Level/Rogue/Event1/Act1.json");
+        assert_eq!(publish_key(runtime), publish_key(index));
+        assert_eq!(
+            publish_key(Path::new("A/dir. /b.json")),
+            publish_key(Path::new("a/DIR/b.json"))
+        );
+        assert_ne!(
+            publish_key(Path::new("a/b.json")),
+            publish_key(Path::new("a/b_json"))
+        );
+    }
 
     #[test]
     fn streaming_failure_preserves_old_file_and_removes_partial_output() {

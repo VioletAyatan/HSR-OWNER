@@ -5,8 +5,10 @@ use reflection::runtime_type::RuntimeType;
 use utils::game_assembly_slice;
 
 mod config;
+mod design_data;
 mod diagnostics;
 mod excel_output;
+mod inventory;
 mod json_output;
 mod managed_error;
 mod memory;
@@ -126,9 +128,17 @@ pub fn dump() -> Result<()> {
             crate::runtime::attach_current_thread_to_il2cpp();
             Ok(())
         })?;
-        operation("TextMap", textmap::dump)?;
+        json_output::reset_published();
+        let design = operation("DesignData: open index", || {
+            design_data::DesignData::open(&design_data::game_data_dir()?)
+        })?;
+        for line in design.describe() {
+            checkpoint(format!("DesignData: {line}"));
+        }
+        operation("TextMap", || textmap::dump(&design))?;
         operation("ExcelOutput", excel_output::dump)?;
         operation("Config", config::dump)?;
+        operation("DesignData", || inventory::dump(&design))?;
         Ok(())
     }));
     let result = match result {

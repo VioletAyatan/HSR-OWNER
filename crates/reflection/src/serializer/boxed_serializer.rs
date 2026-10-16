@@ -144,7 +144,20 @@ pub struct BoxedSerializer {
     checkpoint_visits: usize,
     serialization_depth: usize,
     checkpoint_error: Option<String>,
+    /// Value types whose members are being serialized on the active path.
+    active_value_types: Vec<RuntimeType>,
+    /// Deepest `serialization_depth` reached since construction.
+    max_depth_seen: usize,
+    /// Stop descending when less stack than this is left (0 = default).
+    min_stack_headroom: usize,
+    /// A caught stack overflow whose guard page could not be re-armed yet.
+    stack_guard_lost: bool,
 }
+
+/// Nesting far beyond any real config; reaching it means a member cycle.
+pub const MAX_SERIALIZATION_DEPTH: usize = 1024;
+/// Stack kept free for il2cpp getters, custom serializers and SEH dispatch.
+pub const DEFAULT_STACK_HEADROOM: usize = 256 * 1024;
 
 impl BoxedSerializer {
     pub fn new(skip_names: HashSet<String>) -> Self {
@@ -175,9 +188,15 @@ impl BoxedSerializer {
         self.checkpoint_error = None;
     }
 
+    /// Deepest nesting reached so far (1 = a top-level object).
+    pub fn max_depth(&self) -> usize {
+        self.max_depth_seen
+    }
+
     #[inline]
     pub fn serialize(&mut self, ty: RuntimeType, object: Il2CppObject) -> Result<Value> {
         let entry_depth = self.serialization_depth;
+        let entry_value_types = self.active_value_types.len();
         let serialized = microseh::try_seh(|| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.private_serialize(ty, object, false)
@@ -187,6 +206,7 @@ impl BoxedSerializer {
             Ok(Ok(result)) => result,
             Ok(Err(payload)) => {
                 self.serialization_depth = entry_depth;
+                self.active_value_types.truncate(entry_value_types);
                 if entry_depth == 0 {
                     self.checkpoint_visits = 0;
                     self.checkpoint_error = None;
@@ -200,9 +220,20 @@ impl BoxedSerializer {
             }
             Err(error) => {
                 self.serialization_depth = entry_depth;
+                self.active_value_types.truncate(entry_value_types);
+                if error.code() == microseh::ExceptionCode::StackOverflow {
+                    // The guard page is gone: re-arm it, and fail the whole
+                    // top-level object rather than continue near the limit.
+                    self.stack_guard_lost |= !crate::stack::reset_guard();
+                    if entry_depth > 0 && self.checkpoint_error.is_none() {
+                        self.checkpoint_error =
+                            Some(format!("stack overflow inside {}", ty.il_name()));
+                    }
+                }
                 if entry_depth == 0 {
                     self.checkpoint_visits = 0;
                     self.checkpoint_error = None;
+                    self.rearm_stack_guard();
                 }
                 log::debug!(
                     "[BoxedSerializer] Failed to serialize {}. code: {:?}",
@@ -212,7 +243,20 @@ impl BoxedSerializer {
                 return Err(anyhow::anyhow!("{error:?}"));
             }
         };
+        if entry_depth == 0 {
+            self.rearm_stack_guard();
+        }
         result
+    }
+
+    fn rearm_stack_guard(&mut self) {
+        if self.stack_guard_lost {
+            self.stack_guard_lost = !crate::stack::reset_guard();
+            log::warn!(
+                "[BoxedSerializer] stack guard re-armed after overflow: {}",
+                !self.stack_guard_lost
+            );
+        }
     }
 
     fn private_serialize(
@@ -222,8 +266,10 @@ impl BoxedSerializer {
         is_array: bool,
     ) -> Result<Value> {
         self.serialization_depth += 1;
+        self.max_depth_seen = self.max_depth_seen.max(self.serialization_depth);
         let result = self
             .check_checkpoint()
+            .and_then(|()| self.check_stack(ty))
             .and_then(|()| self.private_serialize_inner(ty, object, is_array));
 
         self.serialization_depth -= 1;
@@ -235,6 +281,39 @@ impl BoxedSerializer {
             self.checkpoint_visits = 0;
         }
         result
+    }
+
+    /// Refuse to descend past the depth ceiling or into the last stack
+    /// headroom. Latched like a checkpoint failure, so the outermost call
+    /// fails instead of returning a silently truncated object.
+    fn check_stack(&mut self, ty: RuntimeType) -> Result<()> {
+        let headroom = match self.min_stack_headroom {
+            0 => DEFAULT_STACK_HEADROOM,
+            n => n,
+        };
+        let reason = if self.serialization_depth > MAX_SERIALIZATION_DEPTH {
+            format!("depth limit {MAX_SERIALIZATION_DEPTH} reached")
+        } else if let Some(left) = crate::stack::remaining()
+            && left < headroom
+        {
+            format!(
+                "stack headroom {} KiB left at depth {}",
+                left / 1024,
+                self.serialization_depth
+            )
+        } else {
+            return Ok(());
+        };
+        let at = if ty.0 == 0 {
+            String::new()
+        } else {
+            format!(" at {}", self.type_il_name(ty))
+        };
+        let message = format!("{reason}{at}");
+        if self.checkpoint_error.is_none() {
+            self.checkpoint_error = Some(message.clone());
+        }
+        Err(anyhow::anyhow!(message))
     }
 
     fn private_serialize_inner(
@@ -557,6 +636,18 @@ impl BoxedSerializer {
     }
 
     fn serialize_type(&mut self, ty: RuntimeType, object: Il2CppObject) -> Result<Value> {
+        let value_type = self.is_value_type(ty).unwrap_or(false);
+        if value_type {
+            self.active_value_types.push(ty);
+        }
+        let result = self.serialize_members(ty, object);
+        if value_type {
+            self.active_value_types.pop();
+        }
+        result
+    }
+
+    fn serialize_members(&mut self, ty: RuntimeType, object: Il2CppObject) -> Result<Value> {
         let fields = self
             .cached_fields
             .entry(ty)
@@ -682,6 +773,15 @@ impl BoxedSerializer {
 
             // Self referencing loop
             if property_type == ty {
+                continue;
+            }
+
+            // A value-type getter returns a fresh copy, so computed properties
+            // can lead back to a value type already on the active path
+            // (FixVec2.x0y -> FixVec3.xy -> FixVec2 -> ...) without ever
+            // repeating an object. Never re-enter an active value type through
+            // a getter; fields carry the stored state and are unaffected.
+            if self.active_value_types.contains(&property_type) {
                 continue;
             }
 
@@ -869,7 +969,52 @@ mod checkpoint_tests {
             checkpoint_visits: 0,
             serialization_depth: 0,
             checkpoint_error: None,
+            active_value_types: Vec::new(),
+            max_depth_seen: 0,
+            min_stack_headroom: 0,
+            stack_guard_lost: false,
         }
+    }
+
+    #[test]
+    fn depth_ceiling_latches_until_the_outermost_call_fails() {
+        let mut serializer = serializer_without_game();
+        // A nested visit one level past the ceiling, below an active parent.
+        serializer.serialization_depth = MAX_SERIALIZATION_DEPTH;
+        let nested = serializer.private_serialize(RuntimeType(0), Il2CppObject::NULL, false);
+        assert!(nested.unwrap_err().to_string().contains("depth limit"));
+        assert_eq!(serializer.serialization_depth, MAX_SERIALIZATION_DEPTH);
+        // Siblings fail fast while latched; the outermost frame reports it once.
+        assert!(serializer.check_checkpoint().is_err());
+        serializer.serialization_depth = 0;
+        let outer = serializer.private_serialize(RuntimeType(0), Il2CppObject::NULL, false);
+        assert!(outer.unwrap_err().to_string().contains("depth limit"));
+        assert_eq!(
+            serializer
+                .serialize(RuntimeType(0), Il2CppObject::NULL)
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(serializer.max_depth(), MAX_SERIALIZATION_DEPTH + 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stack_headroom_stops_descent_before_the_guard_page() {
+        let mut serializer = serializer_without_game();
+        serializer.min_stack_headroom = usize::MAX;
+        let error = serializer
+            .serialize(RuntimeType(0), Il2CppObject::NULL)
+            .unwrap_err();
+        assert!(error.to_string().contains("stack headroom"), "{error}");
+        assert_eq!(serializer.serialization_depth, 0);
+        serializer.min_stack_headroom = 0;
+        assert_eq!(
+            serializer
+                .serialize(RuntimeType(0), Il2CppObject::NULL)
+                .unwrap(),
+            Value::Null
+        );
     }
 
     #[test]

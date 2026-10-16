@@ -143,6 +143,11 @@ pub(super) fn checkpoint(label: impl Into<String>) {
     update(label.into(), true);
 }
 
+/// Record the current operation for crash diagnostics without logging it.
+pub(super) fn quiet(label: impl Into<String>) {
+    update(label.into(), false);
+}
+
 pub(super) fn row_checkpoint(table: &str, row: usize, operation: &str) {
     // Record every call in memory, but only emit periodic progress to disk/UI.
     update(

@@ -2,9 +2,12 @@ use super::{checkpoint, invoke_error, operation};
 use anyhow::{Context, Result, ensure};
 use il2cpp::{
     get_native_method,
-    vm::{boxed_value::BoxedBool, object::Il2CppObject, string::Il2CppString, value::Void},
+    vm::{
+        boxed_value::BoxedBool, method::Il2CppMethod, object::Il2CppObject, string::Il2CppString,
+        value::Void,
+    },
 };
-use reflection::{method_info::MethodInfo, serializer::BoxedSerializer};
+use reflection::{method_info::MethodInfo, runtime_type::RuntimeType, serializer::BoxedSerializer};
 use std::{collections::BTreeMap, path::PathBuf};
 
 mod character;
@@ -53,6 +56,10 @@ pub fn dump() -> Result<()> {
     operation("Config/ConfigCharacter", || {
         character::dump(&mut serializer)
     })?;
+    checkpoint(format!(
+        "Config: serializer max_depth={}",
+        serializer.max_depth()
+    ));
     Ok(())
 }
 
@@ -124,55 +131,64 @@ fn read_excel(name: &str) -> Result<Vec<serde_json::Value>> {
     })
 }
 
-fn dump_from_config_list(
-    func_name: &str,
-    paths: Vec<String>,
-    serializer: &mut BoxedSerializer,
-) -> Result<()> {
-    let paths = prepare_config_paths(func_name, paths);
-    checkpoint(format!("Config: {func_name} paths={}", paths.len()));
-    if paths.is_empty() {
-        return Ok(());
+/// One `GameCoreConfigLoader.LoadX(string)` loader guarded by `ExistsDesignData`.
+pub(super) struct ConfigLoader {
+    name: String,
+    method: Il2CppMethod,
+    return_type: RuntimeType,
+    exists: Il2CppMethod,
+}
+
+impl ConfigLoader {
+    pub(super) fn new(func_name: &str) -> Result<Self> {
+        let method = get_native_method(&format!(
+            "RPG.GameCore.GameCoreConfigLoader::{func_name}(System.String)"
+        ))
+        .with_context(|| format!("missing GameCoreConfigLoader::{func_name}(System.String)"))?;
+        let return_type = MethodInfo::from_handle(method)?.get_return_type()?;
+        let exists = get_native_method("RPG.Client.AssetLoader::ExistsDesignData(System.String)")
+            .context("missing AssetLoader::ExistsDesignData(System.String)")?;
+        Ok(Self {
+            name: func_name.to_string(),
+            method,
+            return_type,
+            exists,
+        })
     }
-    let loader = get_native_method(&format!(
-        "RPG.GameCore.GameCoreConfigLoader::{func_name}(System.String)"
-    ))
-    .with_context(|| format!("missing GameCoreConfigLoader::{func_name}(System.String)"))?;
-    let return_type = MethodInfo::from_handle(loader)?.get_return_type()?;
-    let exists = get_native_method("RPG.Client.AssetLoader::ExistsDesignData(System.String)")
-        .context("missing AssetLoader::ExistsDesignData(System.String)")?;
-    let mut skipped = 0;
-    for path in paths {
-        let argument = Il2CppString::from(path.as_str());
+
+    /// The serialized config, or `None` when the client reports the path absent.
+    pub(super) fn load(
+        &self,
+        path: &str,
+        serializer: &mut BoxedSerializer,
+    ) -> Result<Option<serde_json::Value>> {
+        let func_name = &self.name;
+        let argument = Il2CppString::from(path);
         let present = operation(format!("Config: exists {path}"), || {
-            exists
+            self.exists
                 .invoke::<BoxedBool>(Il2CppObject::NULL, &[&argument])
                 .map(|value| value.unbox())
                 .map_err(invoke_error)
         })?;
         if !present {
-            skipped += 1;
             checkpoint(format!("Config: skip absent path {path}"));
-            continue;
+            return Ok(None);
         }
         // Propagate existing SEH protection as a task failure, never a false success.
-        microseh::try_seh(|| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                let data = operation(format!("Config: load {func_name} path={path}"), || {
-                    loader
-                        .invoke::<Il2CppObject>(Il2CppObject::NULL, &[&argument])
-                        .map_err(invoke_error)
-                })?;
-                ensure!(data.0 != 0, "{func_name} path={path}: loader returned null");
-                let serialized =
-                    operation(format!("Config: serialize {func_name} path={path}"), || {
-                        serializer.serialize(return_type, data)
+        let value = microseh::try_seh(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<serde_json::Value> {
+                    let data = operation(format!("Config: load {func_name} path={path}"), || {
+                        self.method
+                            .invoke::<Il2CppObject>(Il2CppObject::NULL, &[&argument])
+                            .map_err(invoke_error)
                     })?;
-                super::write_json(
-                    &PathBuf::from(format!("./DUMP/Resources/{path}")),
-                    &serialized,
-                )
-            }))
+                    ensure!(data.0 != 0, "{func_name} path={path}: loader returned null");
+                    operation(format!("Config: serialize {func_name} path={path}"), || {
+                        serializer.serialize(self.return_type, data)
+                    })
+                },
+            ))
         })
         .map_err(|error| {
             anyhow::anyhow!("Config {func_name} path={path}: native exception {error:?}")
@@ -185,6 +201,33 @@ fn dump_from_config_list(
                 .unwrap_or("unknown panic payload");
             anyhow::anyhow!("Config {func_name} path={path}: Rust panic: {message}")
         })??;
+        Ok(Some(value))
+    }
+}
+
+fn dump_from_config_list(
+    func_name: &str,
+    paths: Vec<String>,
+    serializer: &mut BoxedSerializer,
+) -> Result<()> {
+    let paths = prepare_config_paths(func_name, paths);
+    checkpoint(format!("Config: {func_name} paths={}", paths.len()));
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let loader = ConfigLoader::new(func_name)?;
+    let mut skipped = 0;
+    for path in paths {
+        let output = PathBuf::from(format!("./DUMP/Resources/{path}"));
+        // Several call sites reach the same graph; publish it once per session.
+        if super::json_output::is_published(&output) {
+            checkpoint(format!("Config: skip already published {path}"));
+            continue;
+        }
+        match loader.load(&path, serializer)? {
+            Some(value) => super::write_json(&output, &value)?,
+            None => skipped += 1,
+        }
     }
     checkpoint(format!(
         "Config: completed {func_name} skipped_absent={skipped}"

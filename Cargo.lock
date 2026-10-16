@@ -1712,6 +1712,7 @@ dependencies = [
  "indexmap 2.14.0",
  "indicatif",
  "log",
+ "lz4_flex",
  "microseh",
  "prost",
  "protox",
@@ -1722,6 +1723,7 @@ dependencies = [
  "ureq",
  "utils",
  "windows 0.62.2",
+ "xxhash-rust",
 ]
 
 [[package]]

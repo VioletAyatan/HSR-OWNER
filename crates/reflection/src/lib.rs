@@ -20,6 +20,7 @@ pub mod self_test;
 pub mod custom_attribute;
 
 pub mod serializer;
+pub mod stack;
 
 static PASSED_TESTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 

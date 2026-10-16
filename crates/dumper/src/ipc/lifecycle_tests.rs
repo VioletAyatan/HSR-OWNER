@@ -998,3 +998,28 @@ fn eof_with_held_responder_sender_does_not_keep_connection_worker_alive() {
         "EOF left the writer receiver alive while a task held its sender"
     );
 }
+
+#[test]
+fn command_threads_reserve_a_deep_serialization_stack() {
+    let (sender, receiver) = mpsc::channel();
+    NativeThreads
+        .spawn(
+            SpawnContext {
+                role: "command",
+                client_id: None,
+                request_id: None,
+                peer: None,
+            },
+            Box::new(move || {
+                let _ = sender.send(reflection::stack::reserved());
+            }),
+        )
+        .unwrap()
+        .join()
+        .unwrap();
+    let reserved = receiver.recv().unwrap().unwrap();
+    assert!(
+        reserved >= lifecycle::COMMAND_STACK_SIZE,
+        "command thread reserved {reserved} bytes"
+    );
+}

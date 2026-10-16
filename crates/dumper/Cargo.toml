@@ -31,6 +31,8 @@ ureq.workspace = true
 byteorder.workspace = true
 prost.workspace = true
 cc.workspace = true
+lz4_flex.workspace = true
+xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 
 [dev-dependencies]
 protox.workspace = true

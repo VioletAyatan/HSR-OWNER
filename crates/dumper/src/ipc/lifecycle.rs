@@ -132,6 +132,11 @@ pub(super) trait ThreadSpawner {
 
 pub(super) struct NativeThreads;
 
+/// Stack reserved (not committed) for command threads. Resources runs on its
+/// command thread and serializes deep config graphs there; the serializer's
+/// headroom check stops well before this, instead of at the 2 MiB default.
+pub(super) const COMMAND_STACK_SIZE: usize = 64 * 1024 * 1024;
+
 impl ThreadSpawner for NativeThreads {
     fn spawn(&self, context: SpawnContext, job: ThreadJob) -> io::Result<JoinHandle<()>> {
         let mut name = format!("ipc-{}", context.role);
@@ -141,7 +146,11 @@ impl ThreadSpawner for NativeThreads {
         if let Some(request_id) = context.request_id {
             name.push_str(&format!("-r{request_id}"));
         }
-        thread::Builder::new().name(name).spawn(job)
+        let mut builder = thread::Builder::new().name(name);
+        if context.role == "command" {
+            builder = builder.stack_size(COMMAND_STACK_SIZE);
+        }
+        builder.spawn(job)
     }
 }
 
