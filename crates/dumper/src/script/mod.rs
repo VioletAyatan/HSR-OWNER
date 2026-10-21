@@ -172,15 +172,20 @@ fn dump_inner(progress: &Progress) -> Result<()> {
         metadata.slots.strings.len(),
         metadata.slots.strings.last()
     );
-    ensure!(
-        calls
-            .indices
-            .iter()
-            .all(|&index| (index as usize) < list_count),
-        "metadata call-site index exceeds validated usage-list count {list_count}"
-    );
+    // Call arguments are recovered by a byte-wise backward scan, which can
+    // decode an immediate's bytes as a second MOV ECX. They are diagnostic,
+    // not the bounds authority: only validated_metadata controls native calls.
+    if let Some(&index) = calls
+        .indices
+        .iter()
+        .find(|&&index| index as usize >= list_count)
+    {
+        log::warn!(
+            "[Script Dumper] scanned call-site index {index} exceeds validated usage-list count {list_count}; ignoring heuristic cross-check, initialization remains bounded by the validated metadata table"
+        );
+    }
     log::info!(
-        "[Script Dumper] verified initialization indices={} call_sites={} unresolved_calls={} max_index={}",
+        "[Script Dumper] scanned initialization indices={} call_sites={} unresolved_calls={} max_index={}",
         calls.indices.len(),
         calls.sites,
         calls.unresolved,
