@@ -30,6 +30,7 @@ mod native_pe;
 mod native_switch;
 mod native_tail;
 mod nt;
+pub mod offline;
 mod output;
 mod proto_asm_parser;
 mod proto_stream;
@@ -807,14 +808,17 @@ fn dump_inner<W: Write>(
         .map_err(io::Error::other)?;
     let nt_map_final = accepted_application.type_aliases;
     let accepted_name_report = accepted_application.report;
+    let accepted_field_seeds = accepted_application.field_seeds;
     // Last naming step: check accepted aliases against client names by token,
     // then name same-token fields in other messages.
     progress.stage("propagate field names by token", final_items.len());
-    let token_report = token_names::propagate(
+    let token_report = token_names::propagate_with_seeds(
         &type_to_item,
         &RETCODE_FIELD_NAME,
         &client_field_names,
         &mut final_items,
+        &accepted_field_seeds,
+        &std::collections::HashSet::new(),
     );
     output::write_protobuf(&final_items, out)?;
     let mut token_report = serde_json::to_vec_pretty(&token_report)?;

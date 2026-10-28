@@ -1,6 +1,7 @@
 use super::{
     names::{apply_type_names, field_name_key, identifier, protox_map_entry_name},
     output::{ProtoItem, TypeToItemMap, is_omitted_oneof_discriminator, short_name, snake_field},
+    token_names::{FieldSeed, FieldTokenSeeds},
 };
 use reflection::runtime_type::RuntimeType;
 use serde::{Deserialize, Serialize};
@@ -244,6 +245,7 @@ pub(super) struct ApplicationReport {
 pub(super) struct AcceptedApplication {
     pub(super) report: ApplicationReport,
     pub(super) type_aliases: HashMap<String, String>,
+    pub(super) field_seeds: FieldTokenSeeds,
 }
 
 impl ApplicationReport {
@@ -1372,6 +1374,7 @@ fn apply_variant_records(
     future_symbols: &HashMap<(Option<RuntimeType>, String), usize>,
     runtime_type: RuntimeType,
     record: &AcceptedType,
+    exact: bool,
     report: &mut ApplicationReport,
 ) {
     if record.variants.is_empty() {
@@ -1415,6 +1418,15 @@ fn apply_variant_records(
         let current = &original[index].0;
         if current == &accepted.accepted {
             report.already_present.push(identity);
+            continue;
+        }
+        // A token-bound enum may have renumbered values: the full generated
+        // variant name must still match.
+        if exact && current != &accepted.expected {
+            report.conflicts.push(format!(
+                "{identity} reason=token-identity-variant-mismatch current={current} expected={}",
+                accepted.expected
+            ));
             continue;
         }
         if !alias_allowed(current, &accepted.expected, accepted.action, true) {
@@ -1524,6 +1536,7 @@ fn apply_manifest(
     }
 
     let mut matched = HashMap::<String, RuntimeType>::new();
+    let mut shape_missing = HashSet::<&str>::new();
     for record in &manifest.types {
         let identity = format!("type={}", record.canonical);
         let candidates = by_shape
@@ -1534,6 +1547,7 @@ fn apply_manifest(
             report
                 .unresolved
                 .push(format!("{identity} reason=shape-not-found"));
+            shape_missing.insert(record.canonical.as_str());
             continue;
         }
         let command = record
@@ -1610,6 +1624,16 @@ fn apply_manifest(
             }
         }
     }
+    // Structure drifted since the manifest version: the obfuscated type token
+    // is still the same identifier, so bind by token. Fields are not bound by
+    // tag here (tags may be reshuffled); they are named through token seeds.
+    let token_matched = match_by_token(manifest, &shape_missing, &graph, &matched, &mut report);
+    let mut all_matched = matched.clone();
+    all_matched.extend(
+        token_matched
+            .iter()
+            .map(|(canonical, runtime_type)| (canonical.clone(), *runtime_type)),
+    );
 
     let manifest_packet_ids = manifest
         .packets
@@ -1636,12 +1660,13 @@ fn apply_manifest(
     let mut packet_ready_types = HashSet::<String>::new();
     for packet in &manifest.packets {
         let identity = format!("packet={}", packet.cmd_id);
-        let Some(runtime_type) = matched.get(&packet.type_canonical).copied() else {
+        let Some(runtime_type) = all_matched.get(&packet.type_canonical).copied() else {
             report
                 .unresolved
                 .push(format!("{identity} reason=type-unmatched"));
             continue;
         };
+        let by_token = token_matched.contains_key(&packet.type_canonical);
         let owners = runtime_by_cmd
             .get(&packet.cmd_id)
             .map(Vec::as_slice)
@@ -1660,7 +1685,11 @@ fn apply_manifest(
             continue;
         }
         let node = &graph.nodes[&runtime_type];
-        if node.fingerprint != packet.type_fingerprint || i32::from(node.cmd_id) != packet.cmd_id {
+        // A token-bound type drifted structurally, so only the command ID
+        // guards its packet binding.
+        if (!by_token && node.fingerprint != packet.type_fingerprint)
+            || i32::from(node.cmd_id) != packet.cmd_id
+        {
             report
                 .conflicts
                 .push(format!("{identity} reason=packet-structural-guard"));
@@ -1684,13 +1713,13 @@ fn apply_manifest(
         packet_ready_types.insert(packet.type_canonical.clone());
     }
 
-    let future_symbols = future_scope_symbol_counts(manifest, &matched, &graph);
+    let future_symbols = future_scope_symbol_counts(manifest, &all_matched, &graph);
     let mut type_candidates = Vec::new();
     for record in &manifest.types {
         let Some(accepted) = &record.accepted_name else {
             continue;
         };
-        let Some(runtime_type) = matched.get(&record.canonical).copied() else {
+        let Some(runtime_type) = all_matched.get(&record.canonical).copied() else {
             continue;
         };
         let item = items[&runtime_type].borrow();
@@ -1750,7 +1779,7 @@ fn apply_manifest(
         let Some(accepted) = &record.accepted_name else {
             continue;
         };
-        let Some(runtime_type) = matched.get(&record.canonical).copied() else {
+        let Some(runtime_type) = all_matched.get(&record.canonical).copied() else {
             continue;
         };
         let item = items[&runtime_type].borrow();
@@ -1772,7 +1801,7 @@ fn apply_manifest(
     }
 
     for record in &manifest.types {
-        let Some(runtime_type) = matched.get(&record.canonical).copied() else {
+        let Some(runtime_type) = all_matched.get(&record.canonical).copied() else {
             continue;
         };
         apply_variant_records(
@@ -1781,6 +1810,7 @@ fn apply_manifest(
             &future_symbols,
             runtime_type,
             record,
+            token_matched.contains_key(&record.canonical),
             &mut report,
         );
     }
@@ -1829,7 +1859,132 @@ fn apply_manifest(
     Ok(AcceptedApplication {
         report,
         type_aliases: final_aliases,
+        field_seeds: field_token_seeds(manifest, &matched, &shape_missing),
     })
+}
+
+/// Bind manifest types whose structure is no longer found to the current type
+/// with the same obfuscated token. Requires one current type of the same kind
+/// that no structural match claimed, and the same command ID (0 for non-packet
+/// types).
+fn match_by_token(
+    manifest: &AcceptedManifest,
+    shape_missing: &HashSet<&str>,
+    graph: &StructuralGraph,
+    matched: &HashMap<String, RuntimeType>,
+    report: &mut ApplicationReport,
+) -> HashMap<String, RuntimeType> {
+    let claimed = matched.values().copied().collect::<HashSet<_>>();
+    let mut by_token = HashMap::<&str, Vec<RuntimeType>>::new();
+    for (runtime_type, node) in &graph.nodes {
+        let local = short_name(&node.raw_path);
+        if is_obfuscated(local) {
+            by_token.entry(local).or_default().push(*runtime_type);
+        }
+    }
+    let mut result = HashMap::new();
+    for record in &manifest.types {
+        if !shape_missing.contains(record.canonical.as_str()) || !is_obfuscated(&record.canonical) {
+            continue;
+        }
+        let identity = format!("type={}", record.canonical);
+        let candidates = by_token
+            .get(record.canonical.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                graph.nodes[candidate].kind.as_str() == record.kind && !claimed.contains(candidate)
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            // The type is absent from this client.
+            continue;
+        }
+        if candidates.len() != 1 {
+            report.ambiguous.push(format!(
+                "{identity} reason=token-identity-count count={}",
+                candidates.len()
+            ));
+            continue;
+        }
+        let runtime_type = candidates[0];
+        let expected_cmd_id = record.cmd_id.unwrap_or(0);
+        let current_cmd_id = graph.nodes[&runtime_type].cmd_id;
+        if expected_cmd_id != current_cmd_id {
+            report.conflicts.push(format!(
+                "{identity} reason=token-identity-cmd-id-mismatch expected={expected_cmd_id} current={current_cmd_id}"
+            ));
+            continue;
+        }
+        report.matches.push(format!(
+            "{identity} mode=token-identity runtime={runtime_type:?}"
+        ));
+        result.insert(record.canonical.clone(), runtime_type);
+    }
+    result
+}
+
+/// Field aliases of manifest types whose structure is no longer found, keyed
+/// by obfuscated token. Tokens decided by a structural match (applied or
+/// rejected there) are excluded, as are tokens with more than one accepted
+/// name and names accepted for more than one token.
+fn field_token_seeds(
+    manifest: &AcceptedManifest,
+    matched: &HashMap<String, RuntimeType>,
+    shape_missing: &HashSet<&str>,
+) -> FieldTokenSeeds {
+    let decided = manifest
+        .types
+        .iter()
+        .filter(|record| matched.contains_key(&record.canonical))
+        .flat_map(|record| record.fields.iter().map(|field| field.expected.as_str()))
+        .collect::<HashSet<_>>();
+    let mut by_token = BTreeMap::<&str, Vec<FieldSeed>>::new();
+    for record in &manifest.types {
+        if !shape_missing.contains(record.canonical.as_str()) {
+            continue;
+        }
+        for field in &record.fields {
+            if !matches!(field.action, AliasAction::Alias)
+                || !is_obfuscated(&field.expected)
+                || decided.contains(field.expected.as_str())
+            {
+                continue;
+            }
+            by_token
+                .entry(field.expected.as_str())
+                .or_default()
+                .push(FieldSeed {
+                    name: snake_field(&field.accepted),
+                    canonical: record.canonical.clone(),
+                    tag: field.tag,
+                });
+        }
+    }
+    let mut tokens_by_name = HashMap::<String, HashSet<&str>>::new();
+    let mut single = Vec::new();
+    for (token, seeds) in by_token {
+        let keys = seeds
+            .iter()
+            .map(|seed| field_name_key(&seed.name))
+            .collect::<HashSet<_>>();
+        if keys.len() != 1 {
+            continue;
+        }
+        let name_key = keys.into_iter().next().unwrap_or_default();
+        tokens_by_name.entry(name_key).or_default().insert(token);
+        single.push((token, seeds.into_iter().next()));
+    }
+    single
+        .into_iter()
+        .filter_map(|(token, seed)| {
+            let seed = seed?;
+            (tokens_by_name[&field_name_key(&seed.name)].len() == 1)
+                .then(|| (token.to_owned(), seed))
+        })
+        .collect()
 }
 
 const EMBEDDED_MANIFEST: &str = include_str!(concat!(
@@ -2114,6 +2269,104 @@ mod tests {
         assert_eq!(packet_ids[&7], "RecoveredParent");
         assert!(report.ambiguous.is_empty());
         assert!(report.conflicts.is_empty());
+    }
+
+    #[test]
+    fn drifted_types_bind_by_token_with_command_guard_and_seed_fields() {
+        let mut source = TypeToItemMap::new();
+        let mut source_packet = message("AAAAAAAAAAA", 7);
+        source_packet.fields = vec![field("uint32", "KKKKKKKKKKK", 1)];
+        insert(&mut source, 1, source_packet);
+        insert(&mut source, 2, message("BBBBBBBBBBB", 9));
+        let source_graph = build_graph(&source, 2).unwrap();
+        let source_field = source_graph.nodes[&RuntimeType(1)].fields[&1].clone();
+        let manifest = json!({
+            "schema_version": 1,
+            "dataset_id": "unit-test",
+            "fingerprint_rounds": 2,
+            "source": {},
+            "types": [
+                type_record(
+                    &source_graph,
+                    RuntimeType(1),
+                    "AAAAAAAAAAA",
+                    Some("RecoveredReq"),
+                    Some(7),
+                    json!([{
+                        "tag": 1,
+                        "shape": source_field.shape,
+                        "oneof_tags": [],
+                        "expected": "KKKKKKKKKKK",
+                        "accepted": "stage_id",
+                        "action": "alias"
+                    }]),
+                ),
+                type_record(
+                    &source_graph,
+                    RuntimeType(2),
+                    "BBBBBBBBBBB",
+                    Some("MovedReq"),
+                    Some(9),
+                    json!([]),
+                )
+            ],
+            "packets": [{
+                "cmd_id": 7,
+                "type_canonical": "AAAAAAAAAAA",
+                "type_fingerprint": source_graph.nodes[&RuntimeType(1)].fingerprint,
+                "accepted_name": "RecoveredReq"
+            }]
+        });
+
+        // Both types drifted: new fields, reshuffled tags.
+        let mut current = TypeToItemMap::new();
+        let mut current_packet = message("AAAAAAAAAAA", 7);
+        current_packet.fields = vec![
+            field("uint64", "LLLLLLLLLLL", 1),
+            field("uint32", "KKKKKKKKKKK", 3),
+        ];
+        insert(&mut current, 10, current_packet);
+        let mut moved = message("BBBBBBBBBBB", 10);
+        moved.fields = vec![field("bool", "MMMMMMMMMMM", 2)];
+        insert(&mut current, 11, moved);
+        let mut packet_ids = HashMap::from([
+            (7, "AAAAAAAAAAA".to_string()),
+            (10, "BBBBBBBBBBB".to_string()),
+        ]);
+
+        let manifest: AcceptedManifest =
+            serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
+        let application = apply_manifest(&mut current, &mut packet_ids, &manifest).unwrap();
+
+        let packet = current[&RuntimeType(10)].borrow();
+        let ProtoItem::Message(packet) = &*packet else {
+            panic!()
+        };
+        assert_eq!(packet.deobfuscated_name.as_deref(), Some("RecoveredReq"));
+        // Tags are not trusted after drift: the field keeps its token here.
+        assert_eq!(packet.fields[1].name, "KKKKKKKKKKK");
+        assert_eq!(packet_ids[&7], "RecoveredReq");
+        let moved = current[&RuntimeType(11)].borrow();
+        let ProtoItem::Message(moved) = &*moved else {
+            panic!()
+        };
+        assert!(moved.deobfuscated_name.is_none());
+        assert_eq!(packet_ids[&10], "BBBBBBBBBBB");
+        assert!(
+            application
+                .report
+                .matches
+                .iter()
+                .any(|row| row.starts_with("type=AAAAAAAAAAA mode=token-identity"))
+        );
+        assert!(
+            application
+                .report
+                .conflicts
+                .iter()
+                .any(|row| row.contains("type=BBBBBBBBBBB reason=token-identity-cmd-id-mismatch"))
+        );
+        assert_eq!(application.field_seeds["KKKKKKKKKKK"].name, "stage_id");
     }
 
     #[test]

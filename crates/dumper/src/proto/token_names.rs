@@ -14,7 +14,13 @@
 //! field). Other disagreements are reported, not resolved. Accepted aliases
 //! only seed tokens that have no client name. Every proposal still passes the per-message collision checks
 //! in `names::apply_field_maps`.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+//!
+//! Accepted aliases whose message drifted structurally since the manifest
+//! version never reach a field by tag. Their tokens are still the same
+//! identifiers, so they are offered as token seeds (`accepted-token`). A seed
+//! is used only for a token that no client name or applied alias covers, and
+//! only when no other token owns the name.
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -25,6 +31,18 @@ use super::{
 
 /// Field names keyed by original message name and wire tag.
 pub(super) type FieldNameSnapshot = HashMap<(String, u32), String>;
+
+/// Accepted field name for an obfuscated token, with the manifest record it
+/// came from.
+#[derive(Clone, Debug)]
+pub(super) struct FieldSeed {
+    pub(super) name: String,
+    pub(super) canonical: String,
+    pub(super) tag: u32,
+}
+
+/// Obfuscated field token -> accepted name, one name per token and per name.
+pub(super) type FieldTokenSeeds = HashMap<String, FieldSeed>;
 
 /// A name owned by another token needs at least this many client fields.
 const MIN_OWNER_SUPPORT: usize = 2;
@@ -78,8 +96,11 @@ pub(super) struct Report {
     fields_rejected: usize,
     obfuscated_fields_before: usize,
     obfuscated_fields_after: usize,
+    accepted_token_seeds: usize,
+    accepted_token_seeds_resolved: usize,
     reverted_aliases: Vec<AliasCheck>,
     alias_conflicts: Vec<AliasCheck>,
+    seed_conflicts: Vec<AliasCheck>,
     tokens: BTreeMap<String, TokenRecord>,
 }
 
@@ -88,6 +109,27 @@ fn message_fields(message: &Message) -> impl Iterator<Item = &Field> {
         .fields
         .iter()
         .chain(message.oneofs.iter().flat_map(|o| o.fields.iter()))
+}
+
+/// Name keys already readable in obfuscated messages. Offline input lost the
+/// tokens of those fields, so their owners are unknown.
+pub(super) fn unknown_owner_names(raw: &TypeToItemMap) -> HashSet<String> {
+    let mut result = HashSet::new();
+    for item in raw.values() {
+        let item = item.borrow();
+        let ProtoItem::Message(message) = &*item else {
+            continue;
+        };
+        if !is_token(super::output::short_name(&message.name)) {
+            continue;
+        }
+        for field in message_fields(message) {
+            if !is_token(&field.name) {
+                result.insert(key(&field.name));
+            }
+        }
+    }
+    result
 }
 
 fn message_fields_mut(message: &mut Message) -> impl Iterator<Item = &mut Field> {
@@ -186,15 +228,39 @@ struct Observed {
 /// `raw` must be generated from the same minimal infos without field names and
 /// `client` must be the snapshot taken before accepted aliases were applied;
 /// all maps keep the original (obfuscated) message name in `Message::name`.
+#[cfg(test)]
 pub(super) fn propagate(
     raw: &TypeToItemMap,
     retcode_token: &str,
     client: &FieldNameSnapshot,
     items: &mut TypeToItemMap,
 ) -> Report {
+    propagate_with_seeds(
+        raw,
+        retcode_token,
+        client,
+        items,
+        &FieldTokenSeeds::new(),
+        &HashSet::new(),
+    )
+}
+
+/// Same as `propagate`, plus accepted-token seeds. `unknown_owner_names`
+/// holds name keys already readable in obfuscated messages whose token is not
+/// known (offline input); a seed with such a name is rejected because another
+/// token may own it.
+pub(super) fn propagate_with_seeds(
+    raw: &TypeToItemMap,
+    retcode_token: &str,
+    client: &FieldNameSnapshot,
+    items: &mut TypeToItemMap,
+    seeds: &FieldTokenSeeds,
+    unknown_owner_names: &HashSet<String>,
+) -> Report {
     let raw_tokens = raw_tokens(raw, retcode_token);
     let mut report = Report {
         obfuscated_fields_before: count_obfuscated(items),
+        accepted_token_seeds: seeds.len(),
         ..Default::default()
     };
     let mut observed = Vec::new();
@@ -360,6 +426,73 @@ pub(super) fn propagate(
         }
     }
 
+    // Accepted-token seeds name tokens that no client name or applied alias
+    // covers. A name owned by another token, or readable somewhere with an
+    // unknown owner, is never seeded.
+    let mut candidate_keys = report
+        .tokens
+        .iter()
+        .filter_map(|(token, record)| {
+            record
+                .candidate
+                .as_ref()
+                .map(|candidate| (key(candidate), token.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut seeded = HashSet::<String>::new();
+    for (message, tag, token) in &unresolved {
+        if report.tokens.contains_key(token) || seeded.contains(token) {
+            continue;
+        }
+        let Some(seed) = seeds.get(token) else {
+            continue;
+        };
+        seeded.insert(token.clone());
+        let seed_key = key(&seed.name);
+        let rejection = if let Some(tokens) = owners.get(&seed_key)
+            && !tokens.contains_key(token)
+        {
+            Some((
+                "name-owned-by-other-token",
+                tokens
+                    .iter()
+                    .map(|(owner, count)| format!("{owner} x{count}"))
+                    .collect(),
+            ))
+        } else if let Some(owner) = candidate_keys.get(&seed_key)
+            && owner != token
+        {
+            Some(("name-used-by-other-token", vec![owner.clone()]))
+        } else if unknown_owner_names.contains(&seed_key) {
+            Some(("name-owner-unknown", Vec::new()))
+        } else {
+            None
+        };
+        if let Some((reason, client_evidence)) = rejection {
+            report.seed_conflicts.push(AliasCheck {
+                message: message.clone(),
+                tag: *tag,
+                token: token.clone(),
+                alias: seed.name.clone(),
+                restored: None,
+                reason,
+                client_evidence,
+            });
+            continue;
+        }
+        candidate_keys.insert(seed_key, token.clone());
+        let record = report.tokens.entry(token.clone()).or_default();
+        record.sources.push(Source {
+            message: seed.canonical.clone(),
+            tag: seed.tag,
+            name: seed.name.clone(),
+            origin: "accepted-token",
+        });
+        record.candidate = Some(snake_field(&seed.name));
+        report.tokens_resolved += 1;
+        report.accepted_token_seeds_resolved += 1;
+    }
+
     let mut scoped = ScopedFieldNames::new();
     for (message, tag, token) in &unresolved {
         let Some(candidate) = report.tokens.get(token).and_then(|r| r.candidate.clone()) else {
@@ -426,11 +559,14 @@ pub(super) fn propagate(
         .retain(|_, record| !record.targets.is_empty() || record.candidate.is_none());
     report.obfuscated_fields_after = count_obfuscated(items);
     log::info!(
-        "[Proto Names] token propagation: aliases_checked={} aliases_reverted={} tokens_resolved={} tokens_conflicting={} proposed={} applied={} rejected={} obfuscated_fields {} -> {}",
+        "[Proto Names] token propagation: aliases_checked={} aliases_reverted={} tokens_resolved={} tokens_conflicting={} seeds={} seeds_resolved={} seed_conflicts={} proposed={} applied={} rejected={} obfuscated_fields {} -> {}",
         report.accepted_aliases_checked,
         report.accepted_aliases_reverted,
         report.tokens_resolved,
         report.tokens_conflicting,
+        report.accepted_token_seeds,
+        report.accepted_token_seeds_resolved,
+        report.seed_conflicts.len(),
         report.fields_proposed,
         report.fields_applied,
         report.fields_rejected,
@@ -763,6 +899,97 @@ mod tests {
         assert_eq!(
             report.reverted_aliases[0].client_evidence,
             ["JKCOAIGJMMM x2"]
+        );
+    }
+
+    fn seed(name: &str) -> FieldSeed {
+        FieldSeed {
+            name: name.into(),
+            canonical: "ZZZZZZZZZZZ".into(),
+            tag: 1,
+        }
+    }
+
+    #[test]
+    fn accepted_token_seeds_fill_only_unowned_tokens() {
+        let raw = TypeToItemMap::from([
+            (
+                RuntimeType(1),
+                message(
+                    "AAAAAAAAAAA",
+                    vec![
+                        field("KKKKKKKKKKK", 1),
+                        field("LLLLLLLLLLL", 2),
+                        field("MMMMMMMMMMM", 3),
+                        field("NNNNNNNNNNN", 4),
+                    ],
+                ),
+            ),
+            (
+                RuntimeType(2),
+                message(
+                    "BBBBBBBBBBB",
+                    vec![field("KKKKKKKKKKK", 5), field("PPPPPPPPPPP", 6)],
+                ),
+            ),
+            (
+                RuntimeType(3),
+                message("CCCCCCCCCCC", vec![field("PPPPPPPPPPP", 7)]),
+            ),
+        ]);
+        let mut items = TypeToItemMap::from([
+            (
+                RuntimeType(1),
+                message(
+                    "AAAAAAAAAAA",
+                    vec![
+                        field("KKKKKKKKKKK", 1),
+                        field("LLLLLLLLLLL", 2),
+                        field("MMMMMMMMMMM", 3),
+                        field("NNNNNNNNNNN", 4),
+                    ],
+                ),
+            ),
+            (
+                RuntimeType(2),
+                message(
+                    "BBBBBBBBBBB",
+                    vec![field("KKKKKKKKKKK", 5), field("item_list", 6)],
+                ),
+            ),
+            (
+                RuntimeType(3),
+                message("CCCCCCCCCCC", vec![field("item_list", 7)]),
+            ),
+        ]);
+        let client = snapshot(&items);
+        let seeds = FieldTokenSeeds::from([
+            // Free: named in both messages carrying the token.
+            ("KKKKKKKKKKK".into(), seed("stage_id")),
+            // Client evidence gives `item_list` to PPP.
+            ("LLLLLLLLLLL".into(), seed("item_list")),
+            // Readable elsewhere with an unknown owner (offline input).
+            ("MMMMMMMMMMM".into(), seed("score")),
+            // Not offered: NNN keeps its token.
+        ]);
+        let unknown = HashSet::from([key("score")]);
+        let report = propagate_with_seeds(&raw, "", &client, &mut items, &seeds, &unknown);
+        assert_eq!(
+            names(&items, 1),
+            ["stage_id", "LLLLLLLLLLL", "MMMMMMMMMMM", "NNNNNNNNNNN"]
+        );
+        assert_eq!(names(&items, 2), ["stage_id", "item_list"]);
+        assert_eq!(report.accepted_token_seeds_resolved, 1);
+        let reasons = report
+            .seed_conflicts
+            .iter()
+            .map(|row| (row.token.as_str(), row.reason))
+            .collect::<Vec<_>>();
+        assert!(reasons.contains(&("LLLLLLLLLLL", "name-owned-by-other-token")));
+        assert!(reasons.contains(&("MMMMMMMMMMM", "name-owner-unknown")));
+        assert_eq!(
+            report.tokens["KKKKKKKKKKK"].sources[0].origin,
+            "accepted-token"
         );
     }
 }

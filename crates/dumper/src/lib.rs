@@ -22,6 +22,9 @@ mod script_v2;
 mod version;
 mod xluau;
 
+/// Offline re-application of proto naming passes to an existing dump.
+pub use proto::offline as proto_offline;
+
 pub fn start_in_process() {
     std::thread::spawn(|| thread_entry(false));
 }

@@ -78,6 +78,19 @@ Copy-Item -LiteralPath $frontend.FullName -Destination 'target/release/hsr-front
 - `LNK1181: 无法打开输入文件 OpenCL.lib`：确认 `LIB` 包含实际存放 x64 `OpenCL.lib` 的目录。若从 Visual Studio 开发者终端构建，需确认其初始化脚本未覆盖此配置；必要时使用上面的 PowerShell 命令重新加载用户 `LIB`。
 - 构建成功只表示编译和链接通过，不表示游戏内功能已完成运行验证。
 
+### 离线重命名已有 Proto Dump
+
+`hsr-proto-rename` 不启动游戏，把 dumper 的命名步骤重新应用到已有的 `DUMP` 目录：先用内嵌的已审核命名清单做结构匹配和混淆标识匹配，再按混淆标识传播字段名。输入目录不会被修改，输出目录必须不存在：
+
+```text
+cargo +nightly build -p dumper --release --locked --bin hsr-proto-rename
+target/release/hsr-proto-rename.exe D:\StarRail_Beta\DUMP <输出目录>
+```
+
+输出 `StarRail.proto`、`packetIds.json`、`cs-type-infos.json`、`sc-packet-handlers.json` 和 `proto-offline-name-evidence.json`（每条命名的来源、匹配方式和被拒原因）。解析器必须逐字节还原输入后才会继续。
+
+混淆标识（11 个 `A`–`P` 字母）对同一原始名称在各版本间保持不变（`4.6.51` 清单中 1,108 个包的类型标识和 CmdID 在 `4.6.54` 中全部一致）。因此清单里结构已变化的类型按标识绑定：类型需同种类且未被结构匹配占用；有包的类型 CmdID 必须相同。这些类型的字段不按 tag 套用（tag 可能重排），只作为标识种子参与传播；名称已被其他标识占用、或已在混淆消息中以可读形式出现（离线时不知道其标识）的种子会被拒绝。游戏内 dump 也执行同样的绑定和种子传播，但使用客户端的完整标识信息，不需要离线的保守规则。
+
 ## NeonTeam
 
 - [Discord](https://discord.gg/RQfpnaPtRV) — official discord
